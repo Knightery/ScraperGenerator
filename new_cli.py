@@ -46,7 +46,7 @@ def add_company_command(args):
         
         # Show generated files
         config_file = f"{args.company.lower().replace(' ', '_')}_config.json"
-        script_file = f"{args.company.lower().replace(' ', '_')}_scraper.py"
+        script_file = os.path.join("scrapers", f"{args.company.lower().replace(' ', '_')}_scraper.py")
         
         if os.path.exists(config_file):
             print(f"✓ Configuration saved to: {config_file}")
@@ -173,9 +173,12 @@ def test_workflow_command(args):
             args.company, job_board_url, analysis
         )
         
+        # Create scrapers directory if it doesn't exist
+        os.makedirs("scrapers", exist_ok=True)
+        
         # Save files
         config_file = f"{args.company.lower().replace(' ', '_')}_test_config.json"
-        script_file = f"{args.company.lower().replace(' ', '_')}_test_scraper.py"
+        script_file = os.path.join("scrapers", f"{args.company.lower().replace(' ', '_')}_test_scraper.py")
         
         with open(config_file, 'w') as f:
             json.dump(scraper_config, f, indent=2)
