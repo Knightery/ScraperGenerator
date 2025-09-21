@@ -1,0 +1,23 @@
+# API Keys
+DEEPSEEK_API_KEY=GLEAG
+BRAVE_API_KEY=GLEAG
+GEMINI_API_KEY=GLEAG
+
+# Database Configuration
+DATABASE_PATH=./jobs.db
+
+# Logging Configuration
+LOG_LEVEL=INFO
+
+# Scraping Configuration
+SCRAPING_INTERVAL=3600  # 1 hour in seconds
+MAX_CONCURRENT_SCRAPERS=5
+DOWNLOAD_DELAY=2
+RANDOMIZE_DOWNLOAD_DELAY=0.5
+
+# AI Configuration
+AI_RETRY_ATTEMPTS=3
+SCRAPER_VALIDATION_THRESHOLD=0.8
+
+# Search Configuration
+DEFAULT_SEARCH_TERMS=internship,careers,jobs
