@@ -1,7 +1,7 @@
 How does it work:
 
-
 SEARCH:
+
 1. Uses Brave API in order to search for a relevant link
 
 SCRAPING:
@@ -16,15 +16,15 @@ SCRAPING:
 
 DB:
 10. When the scraper runs, jobs go to jobs.db sorted by the url to ensure no repeats
-TBA: Merge entries where only field such as location is different, while the time is still the same.
-TBA: Standardize things like location
+Todo: Merge entries where only field such as location is different, while the time is still the same.
+Todo:r Standardize things like location
 
-AUTOUPDATE:
+AUTOUPDATE (not implemented yet):
 11. Run the scraping script once every hour
 
-FRONTEND:
+FRONTEND (not implemented yet):
 12. User can type in anything and then see what happens
 
-TODO: Cinnamon Roll
+TODO: Cinnamon Roll, fix searching by allowing interaction with the search bar
 
-IMPROVEMENT NECESSARY: MAKE IT SO WE CAN SEE PAGINATION, IT IS AT BOTTOM SO SOMETIMES IS TRUNCATED
+IMPROVEMENT NECESSARY: MAKE IT SO WE CAN SEE PAGINATION, IT IS AT BOTTOM SO SOMETIMES IS TRUNCATED - MOSTLY FIXED, one method could be feeding in the entire first html and letting the bot say which tags are irrelevant to then be able to see more at the bottom

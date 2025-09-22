@@ -212,7 +212,7 @@ def list_companies_command(args):
             print()
     else:
         print("No companies registered yet.")
-        print("Use 'python new_cli.py add <company_name>' to add a company.")
+        print("Use 'python scrape_cli.py add <company_name>' to add a company.")
 
 
 def stats_command(args):
@@ -256,11 +256,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python new_cli.py test-workflow "Morgan Stanley"    # Test complete workflow
-  python new_cli.py add "Goldman Sachs"               # Add company to system
-  python new_cli.py scrape "Morgan Stanley"           # Scrape jobs for company
-  python new_cli.py list                              # List all companies
-  python new_cli.py stats "Morgan Stanley"            # Show company statistics
+  python scrape_cli.py test-workflow "Morgan Stanley"    # Test complete workflow
+  python scrape_cli.py add "Goldman Sachs"               # Add company to system
+  python scrape_cli.py scrape "Morgan Stanley"           # Scrape jobs for company
+  python scrape_cli.py list                              # List all companies
+  python scrape_cli.py stats "Morgan Stanley"            # Show company statistics
         """
     )
     

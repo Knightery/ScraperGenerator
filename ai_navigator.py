@@ -2,8 +2,7 @@ import json
 import logging
 import time
 from typing import Dict, List, Optional
-from urllib.parse import urljoin, urlparse
-import requests
+from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from google import genai
 import os
@@ -11,8 +10,11 @@ from datetime import datetime
 from dotenv import load_dotenv
 from pydantic import BaseModel
 from config import Config
+from html_cleaning_utils import clean_html_content_comprehensive
 
 load_dotenv()
+
+gemini_model = "gemini-2.5-flash"
 
 class JobBoardAnalysis(BaseModel):
     job_container_selector: str
@@ -31,6 +33,41 @@ class AINavigator:
         self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
         self._page_cache = {}  # Cache for cleaned page content
         self._content_cache = {}  # Cache for raw page content
+    
+    def _llm_query(self, prompt: str, json_response: bool = False) -> str:
+        """Shared LLM query helper."""
+        config = {"response_mime_type": "application/json"} if json_response else {}
+        response = self.client.models.generate_content(
+            model=gemini_model, contents=prompt, config=config
+        )
+        return response.text.strip()
+    
+    def _playwright_browser(self, headless: bool = True, full_config: bool = False):
+        """Shared Playwright browser setup helper."""
+        from playwright.sync_api import sync_playwright
+        p = sync_playwright()
+        
+        if full_config:
+            browser = p.firefox.launch(
+                headless=headless,
+                firefox_user_prefs={
+                    "javascript.enabled": True,
+                    "dom.webdriver.enabled": False,
+                    "useAutomationExtension": False,
+                    "general.useragent.override": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
+                }
+            )
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
+            )
+            page = context.new_page()
+            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+            return p, browser, page
+        else:
+            browser = p.firefox.launch(headless=headless)
+            page = browser.new_page()
+            return p, browser, page
     
     def analyze_job_board(self, url: str) -> Dict:
         """Analyze a job board website and identify scraping targets with retry mechanism."""
@@ -51,6 +88,19 @@ class AINavigator:
         # Get cleaned HTML for analysis
         content_data = self._extract_clean_content_and_links(page_content, internship_url)
         html_structure = content_data['cleaned_html']
+        
+        # Check for search bar and interact if needed
+        search_result = self._handle_search_bar_interaction(internship_url, page_content)
+        if search_result and search_result.get('new_url'):
+            # URL changed after search, update our target URL and get new content
+            internship_url = search_result['new_url']
+            self.logger.info(f"URL changed after search interaction: {internship_url}")
+            
+            # Get new page content and clean it
+            new_page_content = self._get_page_content(internship_url)
+            if new_page_content:
+                content_data = self._extract_clean_content_and_links(new_page_content, internship_url)
+                html_structure = content_data['cleaned_html']
         
         # Retry loop for AI analysis and validation only
         previous_feedback = None
@@ -115,7 +165,7 @@ class AINavigator:
         self.logger.info("Got page content, analyzing with AI for navigation...")
         
         # Have AI decide what to click
-        next_url = self._ai_click_navigation(initial_url, page_content)
+        next_url = self._ai_navigate(initial_url, page_content)
         
         if next_url and next_url != initial_url:
             self.logger.info(f"AI decided to navigate to: {next_url}")
@@ -147,84 +197,19 @@ class AINavigator:
         
         self.logger.info(f"Cleaning content by removing irrelevant sections (original size: {len(page_content):,} chars)")
         
-        soup = BeautifulSoup(page_content, 'html.parser')
-        
-        # Remove all HTML comments (notes)
-        from bs4 import Comment
-        comments = soup.find_all(string=lambda text: isinstance(text, Comment))
-        for comment in comments:
-            comment.extract()
-        
-        # Remove irrelevant sections by tag
-        irrelevant_tags = [
-            # Original list
-            'script', 'style', 'meta', 'link', 'noscript',
-            'header', 'footer', 'nav', 'aside',
-            
-            # Newly added tags
-            'svg', 'dialog', 'template',
-            'canvas', 'audio', 'video'
-        ]
-        
-        for tag_name in irrelevant_tags:
-            for element in soup.find_all(tag_name):
-                element.decompose()
-        
-        # Remove elements by common class/id patterns
-        irrelevant_selectors = [
-            # Navigation and headers
-            '.header', '.footer', '.nav', '.navigation', '.navbar', '.menu',
-            '.breadcrumb', '.breadcrumbs', '.sidebar', '.aside',
-            '#header', '#footer', '#nav', '#navigation', '#navbar', '#menu',
-            
-            # Cookie/privacy/legal
-            '.cookie-banner', '.cookie-notice', '.privacy-notice', '.legal-notice',
-            '.disclaimer', '.gdpr', '.consent',
-            
-            # Social media and sharing
-            '.social-media', '.social-links', '.social-share', '.share-buttons',
-            '.follow-us', '.social-icons', '.share', '.sharing',
-            
-            # Advertisements
-            '.advertisement', '.ads', '.ad-banner', '.sponsored', '.promo',
-            '.banner', '.popup', '.modal',
-            
-            # Comments and user content
-            '.comments', '.comment-section', '.reviews', '.testimonials',
-            '.user-comments', '.feedback',
-            
-            # Newsletter and forms (non-job related)
-            '.newsletter-signup', '.subscribe-form', '.signup-form',
-            
-            # Utility elements
-            '.back-to-top', '.scroll-to-top', '.skip-link'
-        ]
-        
-        for selector in irrelevant_selectors:
-            for element in soup.select(selector):
-                element.decompose()
-        
-        # Keyword-based filtering removed to preserve pagination elements
-        
-        # Only truncate raw text nodes in divs, preserve links and structure
-        for div in soup.find_all('div'):
-            # Only process divs that have direct text content (not just nested elements)
-            if div.string and len(div.string.strip()) > 100:
-                # Only truncate if this div contains just text, no nested elements like links
-                div.string.replace_with(div.string[:100] + "... [TRUNCATED]")
-        
-        # Apply whitespace stripping and empty line removal to HTML
-        cleaned_html_str = self._strip_whitespace_and_empty_lines(str(soup))
+        # Use comprehensive HTML cleaning function
+        cleaned_html_str = clean_html_content_comprehensive(page_content, self.logger)
         
         # Extract visible text from cleaned content
-        visible_text = soup.get_text(separator=' ', strip=True)
+        cleaned_soup = BeautifulSoup(cleaned_html_str, 'html.parser')
+        visible_text = cleaned_soup.get_text(separator=' ', strip=True)
         visible_text = ' '.join(visible_text.split())  # Clean whitespace
         
         self.logger.info(f"Content cleaned (new size: {len(visible_text):,} chars, reduction: {((len(page_content) - len(visible_text)) / len(page_content) * 100):.1f}%)")
         
         # Extract links from cleaned content
         links = []
-        for link in soup.find_all('a', href=True):
+        for link in cleaned_soup.find_all('a', href=True):
             href = link.get('href', '').strip()
             if href and not href.startswith(('javascript:', 'mailto:', 'tel:', '#')):
                 absolute_url = urljoin(base_url, href)
@@ -245,29 +230,6 @@ class AINavigator:
         self._page_cache[cache_key] = result
         
         return result
-    
-    def _strip_whitespace_and_empty_lines(self, html_content: str) -> str:
-        """Strip all whitespace and remove empty lines from HTML content."""
-        try:
-            # Split content into lines
-            lines = html_content.split('\n')
-            
-            # Process each line: strip whitespace and filter out empty lines
-            cleaned_lines = []
-            for line in lines:
-                stripped_line = line.strip()
-                if stripped_line:  # Only keep non-empty lines
-                    cleaned_lines.append(stripped_line)
-            
-            # Join lines back together
-            return '\n'.join(cleaned_lines)
-        except Exception as e:
-            self.logger.warning(f"Error stripping whitespace: {str(e)}")
-            return html_content
-    
-    def _ai_click_navigation(self, current_url: str, page_content: str) -> Optional[str]:
-        """Have AI analyze the page content and decide which link to click."""
-        return self._ai_navigate(current_url, page_content)
     
     def _ai_navigate(self, current_url: str, page_content: str) -> Optional[str]:
         """AI navigation method to analyze page and decide whether to stay or navigate."""
@@ -291,14 +253,14 @@ class AINavigator:
         links_text = "\n".join(f"{i}. \"{link['text']}\" -> {link['url']}" 
                               for i, link in enumerate(relevant_links, 1))
         
-        system_prompt = """You are analyzing a careers website to find internship job listings.
+        prompt = f"""You are analyzing a careers website to find internship job listings.
 
 If you see actual job postings with titles and apply buttons/links, return "STAY".
 If only general information, look for: "View all internships", "Search internship opportunities", "Apply for internships", "Browse positions", "Job search", "Opportunities"
 
-Return: "STAY", number (1-N) for link to click, or "0" if no relevant links"""
-        
-        user_prompt = f"""Analyze this careers page: {current_url}
+Return: "STAY", number (1-N) for link to click, or "0" if no relevant links
+
+Analyze this careers page: {current_url}
 
 PAGE CONTENT:
 {visible_text[:5000]}
@@ -306,16 +268,11 @@ PAGE CONTENT:
 AVAILABLE LINKS TO CLICK:
 {links_text}
 
-Does this page show specific internship job listings, or do I need to click a link to find them?"""
+Does this page show specific internship job listings, or do I need to click a link to find them?
+
+Response (ONLY return 'STAY', a number 1-N, or '0'):"""
         
-        combined_prompt = f"{system_prompt}\n\n{user_prompt}\n\nResponse (ONLY return 'STAY', a number 1-N, or '0'):"
-        
-        response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=combined_prompt
-        )
-        
-        response_text = response.text.strip().upper()
+        response_text = self._llm_query(prompt).upper()
         self.logger.info(f"AI navigation decision: {response_text}")
         
         if response_text == "STAY":
@@ -334,72 +291,111 @@ Does this page show specific internship job listings, or do I need to click a li
         
         return current_url
     
-    def _get_page_content(self, url: str) -> Optional[str]:
-        """Get page content using Playwright with Firefox and anti-detection."""
-        # Check cache first
-        if url in self._content_cache:
-            self.logger.info(f"Using cached page content for {url}")
-            return self._content_cache[url]
+    def _handle_search_bar_interaction(self, url: str, page_content: str) -> Optional[Dict]:
+        """Handle search bar detection and interaction if needed."""
+        search_bar = self._detect_search_bar(page_content)
+        if not search_bar or not self._llm_needs_search(url, page_content, search_bar):
+            return None
+        return self._perform_search(url, search_bar)
+    
+    def _detect_search_bar(self, page_content: str) -> Optional[Dict]:
+        """Detect search bar elements using BeautifulSoup tag-based method."""
+        soup = BeautifulSoup(page_content, 'html.parser')
         
-        from playwright.sync_api import sync_playwright
+        # Find search inputs with job-related context
+        for input_elem in soup.find_all('input'):
+            attrs = str(input_elem).lower()
+            context = input_elem.parent.get_text().lower() if input_elem.parent else ""
+            
+            # Check if it's a search input
+            is_search = any(term in attrs for term in ['search', 'job', 'keyword', 'career']) or input_elem.get('type') == 'search'
+            has_job_context = any(term in (attrs + context) for term in ['job', 'career', 'intern', 'position'])
+            
+            if is_search and has_job_context:
+                return {
+                    'id': input_elem.get('id', ''),
+                    'name': input_elem.get('name', ''),
+                    'class': ' '.join(input_elem.get('class', [])),
+                    'data_automation_id': input_elem.get('data-automation-id', ''),
+                    'current_value': input_elem.get('value', '')
+                }
+        return None
+    
+    def _llm_needs_search(self, url: str, page_content: str, search_bar: Dict) -> bool:
+        """Use LLM to evaluate if we need to perform a search."""
+        visible_text = self._extract_clean_content_and_links(page_content, url)['visible_text'][:8000]
+        
+        prompt = f"""Analyze this job board: {url}
+
+Search bar current value: "{search_bar.get('current_value', '')}"
+
+Page content: {visible_text}
+
+Return JSON: {{"needs_search": true/false, "search_query": "intern"}}
+
+Return needs_search: true if page shows mostly non-internship jobs and search would help filter."""
+
+        try:
+            result = json.loads(self._llm_query(prompt, json_response=True))
+            self.search_query = result.get('search_query', 'intern')
+            return result.get('needs_search', False)
+        except:
+            return False
+    
+    def _perform_search(self, url: str, search_bar: Dict) -> Optional[Dict]:
+        """Perform search interaction using Playwright."""
         import time
-        import random
         
         try:
-            with sync_playwright() as p:
-                browser = p.firefox.launch(
-                    headless=True,
-                    firefox_user_prefs={
-                        "javascript.enabled": True,
-                        "dom.webdriver.enabled": False,
-                        "useAutomationExtension": False,
-                        "general.useragent.override": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
-                    }
-                )
+            p, browser, page = self._playwright_browser()
+            with p:
+                page.goto(url, wait_until='networkidle')
                 
-                context = browser.new_context(
-                    viewport={'width': 1920, 'height': 1080},
-                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
-                )
+                # Build selectors and try search
+                selectors = [f"#{search_bar['id']}" if search_bar.get('id') else None,
+                           f"input[name='{search_bar['name']}']" if search_bar.get('name') else None,
+                           f"input[data-automation-id='{search_bar['data_automation_id']}']" if search_bar.get('data_automation_id') else None,
+                           "input[type='search']", "input[placeholder*='search' i]"]
                 
-                page = context.new_page()
-                
-                page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => undefined,
-                });
-                """)
-                
+                for selector in filter(None, selectors):
+                    try:
+                        page.fill(selector, getattr(self, 'search_query', 'intern'))
+                        page.press(selector, 'Enter')
+                        time.sleep(2)
+                        new_url = page.url
+                        if new_url != url:
+                            browser.close()
+                            return {'search_performed': True, 'new_url': new_url}
+                    except:
+                        continue
+                        
+                browser.close()
+                return None
+        except Exception as e:
+            raise Exception(f"Failed to perform search on {url}: {str(e)}")
+    
+    def _get_page_content(self, url: str) -> Optional[str]:
+        """Get page content using Playwright with Firefox and anti-detection."""
+        if url in self._content_cache:
+            return self._content_cache[url]
+        
+        import time
+        
+        try:
+            p, browser, page = self._playwright_browser(full_config=True)
+            with p:
                 time.sleep(3)
                 page.goto(url, wait_until='networkidle', timeout=60000)
                 page.wait_for_load_state("networkidle")
-                time.sleep(5)  # Wait 5 seconds for all dynamic content to load
+                time.sleep(5)
                 
                 content = page.content()
                 browser.close()
-                
-                # Cache the content
                 self._content_cache[url] = content
-                
                 return content
                 
-        except Exception:
-            # Simple requests fallback
-            try:
-                session = requests.Session()
-                session.headers.update({
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
-                })
-                
-                response = session.get(url, timeout=30)
-                if response.status_code == 200:
-                    # Cache the fallback content too
-                    self._content_cache[url] = response.text
-                    return response.text
-            except Exception:
-                pass
-                
-        return None
+        except Exception as e:
+            raise Exception(f"Failed to get page content for {url}: {str(e)}")
     
     def _analyze_with_ai(self, url: str, page_content: str) -> Dict:
         """Use AI to analyze the job board structure."""
@@ -444,7 +440,7 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
         combined_prompt = f"{system_prompt}\n\n{user_prompt}"
         
         response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=gemini_model,
             contents=combined_prompt,
             config={
                 "response_mime_type": "application/json",
@@ -522,7 +518,7 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
         combined_prompt = f"{system_prompt}\n\n{user_prompt}"
 
         response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=gemini_model,
             contents=combined_prompt,
             config={
                 "response_mime_type": "application/json",
@@ -576,20 +572,7 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
             # Import here to avoid circular imports
             from playwright_scraper import PlaywrightScraperSync
             scraper = PlaywrightScraperSync()
-            
-            # Test all selectors
-            selectors_to_test = {
-                'job_container_selector': analysis.get('job_container_selector', ''),
-                'title_selector': analysis.get('title_selector', ''),
-                'url_selector': analysis.get('url_selector', ''),
-                'description_selector': analysis.get('description_selector', ''),
-                'location_selector': analysis.get('location_selector', ''),
-                'pagination_selector': analysis.get('pagination_selector', '')
-            }
-            
-            # Filter out empty selectors
-            non_empty_selectors = {k: v for k, v in selectors_to_test.items() if v.strip()}
-            
+
             # Test job extraction (this also tests selectors)
             test_config = {
                 'company_name': 'TestCompany',
@@ -665,14 +648,26 @@ Return ONLY a valid JSON object with these exact keys:
   "retry_recommended": true/false
 }
 
-Criteria for success:
-- Job container selector finds elements
-- Title selector extracts job titles successfully  
-- URL selector extracts valid job links
-- At least some jobs were extracted
-- If pagination selector provided, it should work
+Evaluation guidelines:
+- CRITICAL REQUIREMENTS (must work for success):
+  * Job container selector finds job elements
+  * Title selector extracts job titles successfully
+  * URL selector extracts valid job links
+  * At least some jobs were extracted with titles and URLs
 
-If critical selectors fail or no jobs found, recommend retry."""
+- OPTIONAL ELEMENTS (empty/missing is acceptable):
+  * Description selector - job pages may not have descriptions on listing pages
+  * Location selector - some sites don't show location in listings
+  * Requirements selector - often not available on listing pages
+  * Pagination selector - only needed if site has multiple pages
+
+- EVALUATION FOCUS:
+  * Only flag issues with selectors that are failing to work when they should
+  * Don't penalize empty optional selectors - they may be intentionally empty
+  * Focus on whether the scraper successfully extracts the core job data (title, URL)
+  * Consider the context: listing pages vs detail pages have different available data
+
+Only recommend retry if CRITICAL selectors are broken or no jobs are being extracted."""
 
         user_prompt = f"""Evaluate this job scraper configuration:
 
@@ -696,17 +691,8 @@ HTML STRUCTURE (for reference):
 Evaluate the configuration quality and recommend if retry is needed."""
 
         try:
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=f"{system_prompt}\n\n{user_prompt}",
-                config={
-                    "response_mime_type": "application/json"
-                }
-            )
-            
-            evaluation = json.loads(response.text)
+            evaluation = json.loads(self._llm_query(f"{system_prompt}\n\n{user_prompt}", json_response=True))
             self.logger.info(f"LLM evaluation: {evaluation.get('success')}")
-            
             return evaluation
             
         except Exception as e:
@@ -718,7 +704,6 @@ Evaluate the configuration quality and recommend if retry is needed."""
                 "suggestions": ["Retry analysis"],
                 "retry_recommended": True
             }
-    
     
     def generate_scraper_config(self, company_name: str, url: str, analysis: Dict) -> Dict:
         """Generate Playwright scraper configuration."""
@@ -795,7 +780,6 @@ def get_scraper_config():
         'max_pages': 999  # Unlimited - will stop automatically based on end conditions
     }}
 
-
 def main():
     """Main scraper function."""
     setup_logging()
@@ -864,18 +848,3 @@ if __name__ == "__main__":
 '''
         
         return script_template
-    
-    def evaluate_scraper_performance(self, scraped_data: List[Dict]) -> Dict:
-        """Simple scraper performance evaluation."""
-        total_jobs = len(scraped_data)
-        jobs_with_titles = sum(1 for job in scraped_data if job.get('title', '').strip())
-        jobs_with_urls = sum(1 for job in scraped_data if job.get('url', '').strip())
-        
-        success = jobs_with_titles > 0 and jobs_with_urls > 0 and total_jobs >= 1
-        
-        return {
-            "success": success,
-            "total_jobs": total_jobs,
-            "jobs_with_titles": jobs_with_titles,
-            "jobs_with_urls": jobs_with_urls
-        }
