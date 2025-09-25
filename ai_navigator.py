@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from config import Config
 from html_cleaning_utils import clean_html_content_comprehensive
+from playwright.sync_api import sync_playwright
+from playwright_scraper import PlaywrightScraperSync
 
 load_dotenv()
 
@@ -26,13 +28,22 @@ class JobBoardAnalysis(BaseModel):
     has_dynamic_loading: bool
 
 class AINavigator:
-    """AI-powered website navigation and scraper generation using Gemini."""
+    """
+    AI-powered website navigation and scraper generation using Gemini.
+    
+    Uses its own browser session for navigation, content fetching, and search interactions.
+    Uses PlaywrightScraper for validation and testing of generated scraper configurations.
+    """
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
         self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
         self._page_cache = {}  # Cache for cleaned page content
         self._content_cache = {}  # Cache for raw page content
+        # Browser session for navigation and content fetching
+        self._playwright = None
+        self._browser = None
+        self._context = None
     
     def _llm_query(self, prompt: str, json_response: bool = False) -> str:
         """Shared LLM query helper."""
@@ -42,14 +53,13 @@ class AINavigator:
         )
         return response.text.strip()
     
-    def _playwright_browser(self, headless: bool = True, full_config: bool = False):
-        """Shared Playwright browser setup helper."""
-        from playwright.sync_api import sync_playwright
-        p = sync_playwright()
-        
-        if full_config:
-            browser = p.firefox.launch(
-                headless=headless,
+    def _ensure_browser(self):
+        """Ensure browser session is running."""
+        if not self._browser:
+            self.logger.info("Starting new browser session...")
+            self._playwright = sync_playwright().start()
+            self._browser = self._playwright.firefox.launch(
+                headless=True,
                 firefox_user_prefs={
                     "javascript.enabled": True,
                     "dom.webdriver.enabled": False,
@@ -57,101 +67,140 @@ class AINavigator:
                     "general.useragent.override": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
                 }
             )
-            context = browser.new_context(
+            self._context = self._browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
                 user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
             )
-            page = context.new_page()
-            page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-            return p, browser, page
         else:
-            browser = p.firefox.launch(headless=headless)
-            page = browser.new_page()
-            return p, browser, page
+            self.logger.info("Reusing existing browser session...")
+    
+    def _new_page(self):
+        """Get a new page from the shared browser session."""
+        self._ensure_browser()
+        page = self._context.new_page()
+        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        return page
+    
+    def _close_browser(self):
+        """Close the browser session."""
+        if self._context:
+            self._context.close()
+        if self._browser:
+            self._browser.close()
+        if self._playwright:
+            self._playwright.stop()
+        self._playwright = self._browser = self._context = None
+    
+    def _export_cleaned_html(self, cleaned_html: str, url: str):
+        """Export cleaned HTML to file for debugging."""
+        import re
+        import os
+        
+        # Create safe filename from URL
+        safe_filename = re.sub(r'[^\w\-_.]', '_', url.replace('https://', '').replace('http://', ''))
+        safe_filename = re.sub(r'_+', '_', safe_filename)  # Collapse multiple underscores
+        safe_filename = safe_filename.strip('_')  # Remove leading/trailing underscores
+        
+        # Create debug directory
+        debug_dir = "debug_html"
+        os.makedirs(debug_dir, exist_ok=True)
+        
+        # Export cleaned HTML
+        filename = f"{debug_dir}/{safe_filename}_cleaned.html"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(cleaned_html)
+            self.logger.info(f"Exported cleaned HTML to: {filename}")
+        except Exception as e:
+            self.logger.warning(f"Failed to export HTML: {str(e)}")
     
     def analyze_job_board(self, url: str) -> Dict:
         """Analyze a job board website and identify scraping targets with retry mechanism."""
         self.logger.info(f"Analyzing job board: {url}")
         
-        max_attempts = Config.AI_RETRY_ATTEMPTS
-        
-        # Do navigation and page fetching only once
-        self.logger.info("Initial navigation and page fetching...")
-        internship_url = self._find_internship_page(url)
-        if not internship_url:
-            return {"error": "Could not find internship page"}
-        
-        page_content = self._get_page_content(internship_url)
-        if not page_content:
-            return {"error": "Could not access internship page content"}
-        
-        # Get cleaned HTML for analysis
-        content_data = self._extract_clean_content_and_links(page_content, internship_url)
-        html_structure = content_data['cleaned_html']
-        
-        # Check for search bar and interact if needed
-        search_result = self._handle_search_bar_interaction(internship_url, page_content)
-        if search_result and search_result.get('new_url'):
-            # URL changed after search, update our target URL and get new content
-            internship_url = search_result['new_url']
-            self.logger.info(f"URL changed after search interaction: {internship_url}")
+        try:
+            max_attempts = Config.AI_RETRY_ATTEMPTS
             
-            # Get new page content and clean it
-            new_page_content = self._get_page_content(internship_url)
-            if new_page_content:
-                content_data = self._extract_clean_content_and_links(new_page_content, internship_url)
-                html_structure = content_data['cleaned_html']
-        
-        # Retry loop for AI analysis and validation only
-        previous_feedback = None
-        
-        for attempt in range(1, max_attempts + 1):
-            self.logger.info(f"Analysis attempt {attempt}/{max_attempts}")
+            # Do navigation and page fetching only once
+            self.logger.info("Initial navigation and page fetching...")
+            internship_url = self._find_internship_page(url)
+            if not internship_url:
+                return {"error": "Could not find internship page"}
             
-            try:
-                # Generate analysis with previous feedback if available
-                analysis = self._analyze_with_ai_with_feedback(internship_url, html_structure, previous_feedback)
-                if "error" in analysis:
-                    self.logger.warning(f"Attempt {attempt}: AI analysis failed: {analysis['error']}")
+            page_content = self._get_page_content(internship_url)
+            if not page_content:
+                return {"error": "Could not access internship page content"}
+            
+            # Get cleaned HTML for analysis
+            content_data = self._extract_clean_content_and_links(page_content, internship_url)
+            html_structure = content_data['cleaned_html']
+            
+            # Check for search bar and interact if needed
+            search_result = self._handle_search_bar_interaction(internship_url, page_content)
+            if search_result and search_result.get('new_url'):
+                # URL changed after search, update our target URL and get new content
+                internship_url = search_result['new_url']
+                self.logger.info(f"URL changed after search interaction: {internship_url}")
+                
+                # Get new page content and clean it
+                new_page_content = self._get_page_content(internship_url)
+                if new_page_content:
+                    content_data = self._extract_clean_content_and_links(new_page_content, internship_url)
+                    html_structure = content_data['cleaned_html']
+            
+            # Retry loop for AI analysis and validation only
+            previous_feedback = None
+            
+            for attempt in range(1, max_attempts + 1):
+                self.logger.info(f"Analysis attempt {attempt}/{max_attempts}")
+                
+                try:
+                    # Generate analysis with previous feedback if available
+                    analysis = self._analyze_with_ai_with_feedback(internship_url, html_structure, previous_feedback)
+                    if "error" in analysis:
+                        self.logger.warning(f"Attempt {attempt}: AI analysis failed: {analysis['error']}")
+                        if attempt < max_attempts:
+                            self._wait_before_retry(attempt)
+                            continue
+                        return analysis
+                    
+                    analysis["final_url"] = internship_url
+                    
+                    # Validate the generated config
+                    validation_result = self._validate_complete_config(analysis, internship_url, html_structure)
+                    
+                    if validation_result["success"]:
+                        self.logger.info(f"Analysis successful on attempt {attempt}")
+                        analysis.update(validation_result)
+                        return analysis
+                    else:
+                        # Prepare feedback for next attempt
+                        previous_feedback = {
+                            "previous_analysis": analysis,
+                            "validation_issues": validation_result.get('issues', []),
+                            "suggestions": validation_result.get('suggestions', []),
+                            "attempt": attempt
+                        }
+                        
+                        error_msg = validation_result.get('error', f"LLM recommended retry. Issues: {validation_result.get('issues', [])}")
+                        self.logger.warning(f"Attempt {attempt}: Config validation failed: {error_msg}")
+                        
+                        if attempt < max_attempts:
+                            self._wait_before_retry(attempt)
+                            continue
+                        return {"error": f"Config validation failed after all retry attempts: {error_msg}"}
+                        
+                except Exception as e:
+                    self.logger.error(f"Attempt {attempt}: Unexpected error during analysis: {str(e)}")
                     if attempt < max_attempts:
                         self._wait_before_retry(attempt)
                         continue
-                    return analysis
-                
-                analysis["final_url"] = internship_url
-                
-                # Validate the generated config
-                validation_result = self._validate_complete_config(analysis, internship_url, html_structure)
-                
-                if validation_result["success"]:
-                    self.logger.info(f"Analysis successful on attempt {attempt}")
-                    analysis.update(validation_result)
-                    return analysis
-                else:
-                    # Prepare feedback for next attempt
-                    previous_feedback = {
-                        "previous_analysis": analysis,
-                        "validation_issues": validation_result.get('issues', []),
-                        "suggestions": validation_result.get('suggestions', []),
-                        "attempt": attempt
-                    }
-                    
-                    error_msg = validation_result.get('error', f"LLM recommended retry. Issues: {validation_result.get('issues', [])}")
-                    self.logger.warning(f"Attempt {attempt}: Config validation failed: {error_msg}")
-                    
-                    if attempt < max_attempts:
-                        self._wait_before_retry(attempt)
-                        continue
-                    return {"error": f"Config validation failed after all retry attempts: {error_msg}"}
-                    
-            except Exception as e:
-                self.logger.error(f"Attempt {attempt}: Unexpected error during analysis: {str(e)}")
-                if attempt < max_attempts:
-                    self._wait_before_retry(attempt)
-                    continue
-                return {"error": f"Analysis failed after all retry attempts: {str(e)}"}
-        
-        return {"error": "Analysis failed after all retry attempts"}
+                    return {"error": f"Analysis failed after all retry attempts: {str(e)}"}
+            
+            return {"error": "Analysis failed after all retry attempts"}
+        finally:
+            # Always close browser when analysis is complete
+            self._close_browser()
     
     def _find_internship_page(self, initial_url: str) -> Optional[str]:
         """Navigate from a general careers page to the specific internship page."""
@@ -200,6 +249,14 @@ class AINavigator:
         # Use comprehensive HTML cleaning function
         cleaned_html_str = clean_html_content_comprehensive(page_content, self.logger)
         
+        # Safety check for None return
+        if cleaned_html_str is None:
+            self.logger.warning("HTML cleaning returned None, using original content")
+            cleaned_html_str = page_content
+        
+        # Export cleaned HTML for debugging
+        self._export_cleaned_html(cleaned_html_str, base_url)
+        
         # Extract visible text from cleaned content
         cleaned_soup = BeautifulSoup(cleaned_html_str, 'html.parser')
         visible_text = cleaned_soup.get_text(separator=' ', strip=True)
@@ -217,6 +274,19 @@ class AINavigator:
                 if link_text:  # Only include links with text
                     links.append({
                         'text': link_text,
+                        'url': absolute_url
+                    })
+        
+        # Extract iframe src links
+        for iframe in cleaned_soup.find_all('iframe', src=True):
+            src = iframe.get('src', '').strip()
+            if src and not src.startswith(('javascript:', 'mailto:', 'tel:', '#')):
+                absolute_url = urljoin(base_url, src)
+                # Use iframe attributes or surrounding text as link text
+                iframe_text = iframe.get('title', '') or iframe.get('name', '') or iframe.get('id', '') or 'iframe'
+                if iframe_text:
+                    links.append({
+                        'text': iframe_text,
                         'url': absolute_url
                     })
         
@@ -242,9 +312,10 @@ class AINavigator:
             return current_url
         
         # Filter links containing job-related keywords first
-        job_keywords = ['jobs', 'intern', 'oppor']  # oppor catches opportunity/opportunities
+        job_keywords = ['jobs', 'intern', 'oppor', 'careers']  # oppor catches opportunity/opportunities
         filtered_links = [link for link in links 
-                         if any(keyword in link['text'].lower() for keyword in job_keywords)]
+                         if any(keyword in link['text'].lower() or keyword in link['url'].lower() 
+                               for keyword in job_keywords)]
         
         # Use filtered links if found, otherwise use all links
         relevant_links = filtered_links if filtered_links else links
@@ -282,8 +353,9 @@ Response (ONLY return 'STAY', a number 1-N, or '0'):"""
             selection = int(response_text)
             if 1 <= selection <= len(relevant_links):
                 selected_link = relevant_links[selection - 1]
-                self.logger.info(f"AI selected link {selection}: '{selected_link['text']}' -> {selected_link['url']}")
-                return selected_link['url']
+                selected_url = selected_link['url']
+                self.logger.info(f"AI selected link {selection}: '{selected_link['text']}' -> {selected_url}")
+                return selected_url
             elif selection == 0:
                 return current_url
         except ValueError:
@@ -293,86 +365,141 @@ Response (ONLY return 'STAY', a number 1-N, or '0'):"""
     
     def _handle_search_bar_interaction(self, url: str, page_content: str) -> Optional[Dict]:
         """Handle search bar detection and interaction if needed."""
-        search_bar = self._detect_search_bar(page_content)
-        if not search_bar or not self._llm_needs_search(url, page_content, search_bar):
+        search_analysis = self._llm_analyze_search_need(url, page_content)
+        if not search_analysis or not search_analysis.get('needs_search'):
             return None
-        return self._perform_search(url, search_bar)
+        return self._perform_search(url, search_analysis)
     
-    def _detect_search_bar(self, page_content: str) -> Optional[Dict]:
-        """Detect search bar elements using BeautifulSoup tag-based method."""
-        soup = BeautifulSoup(page_content, 'html.parser')
+    def _llm_analyze_search_need(self, url: str, page_content: str) -> Optional[Dict]:
+        """Use LLM to analyze if we need to search and identify search elements."""
+        content_data = self._extract_clean_content_and_links(page_content, url)
+        visible_text = content_data['visible_text'][:8000]
+        html_structure = content_data['cleaned_html'][:100000]  # Limit HTML for analysis
         
-        # Find search inputs with job-related context
-        for input_elem in soup.find_all('input'):
-            attrs = str(input_elem).lower()
-            context = input_elem.parent.get_text().lower() if input_elem.parent else ""
-            
-            # Check if it's a search input
-            is_search = any(term in attrs for term in ['search', 'job', 'keyword', 'career']) or input_elem.get('type') == 'search'
-            has_job_context = any(term in (attrs + context) for term in ['job', 'career', 'intern', 'position'])
-            
-            if is_search and has_job_context:
-                return {
-                    'id': input_elem.get('id', ''),
-                    'name': input_elem.get('name', ''),
-                    'class': ' '.join(input_elem.get('class', [])),
-                    'data_automation_id': input_elem.get('data-automation-id', ''),
-                    'current_value': input_elem.get('value', '')
-                }
-        return None
-    
-    def _llm_needs_search(self, url: str, page_content: str, search_bar: Dict) -> bool:
-        """Use LLM to evaluate if we need to perform a search."""
-        visible_text = self._extract_clean_content_and_links(page_content, url)['visible_text'][:8000]
-        
-        prompt = f"""Analyze this job board: {url}
+        prompt = f"""Analyze this job board page to determine if search interaction is needed.
 
-Search bar current value: "{search_bar.get('current_value', '')}"
+URL: {url}
 
-Page content: {visible_text}
+PAGE CONTENT:
+{visible_text}
 
-Return JSON: {{"needs_search": true/false, "search_query": "intern"}}
+HTML STRUCTURE:
+{html_structure}
 
-Return needs_search: true if page shows mostly non-internship jobs and search would help filter."""
+TASK: Determine if this page shows actual job listings OR needs search interaction.
+
+Return needs_search: FALSE if you see actual job postings with titles and apply buttons.
+Return needs_search: TRUE if you only see search forms, filters, or program descriptions.
+
+If needs_search is TRUE, identify the search elements by examining the HTML:
+
+Return ONLY a valid JSON object:
+{{
+  "needs_search": true/false,
+  "search_query": "internship" (or relevant term),
+  "search_input_selector": "exact CSS selector for the search input field",
+  "search_submit_selector": "exact CSS selector for the submit button/link",
+  "reasoning": "brief explanation"
+}}
+
+Guidelines:
+- Analyze the actual HTML structure to find the real selectors
+- search_input_selector: look for input fields with type="text", type="search", or search-related names/ids
+- search_submit_selector: look for buttons, links, or elements that trigger search (could be button, a tag, etc.)
+- Return the EXACT selectors from the HTML, not generic examples"""
 
         try:
             result = json.loads(self._llm_query(prompt, json_response=True))
-            self.search_query = result.get('search_query', 'intern')
-            return result.get('needs_search', False)
-        except:
-            return False
+            self.logger.info(f"LLM search analysis: {result.get('reasoning', 'No reasoning provided')}")
+            return result
+        except Exception as e:
+            self.logger.warning(f"LLM search analysis failed: {str(e)}")
+            return None
     
-    def _perform_search(self, url: str, search_bar: Dict) -> Optional[Dict]:
-        """Perform search interaction using Playwright."""
+    def _perform_search(self, url: str, search_analysis: Dict) -> Optional[Dict]:
+        """Perform search interaction using LLM-identified selectors."""
         import time
-        
         try:
-            p, browser, page = self._playwright_browser()
-            with p:
+            page = self._new_page()
+            try:
                 page.goto(url, wait_until='networkidle')
                 
-                # Build selectors and try search
-                selectors = [f"#{search_bar['id']}" if search_bar.get('id') else None,
-                           f"input[name='{search_bar['name']}']" if search_bar.get('name') else None,
-                           f"input[data-automation-id='{search_bar['data_automation_id']}']" if search_bar.get('data_automation_id') else None,
-                           "input[type='search']", "input[placeholder*='search' i]"]
+                search_query = search_analysis.get('search_query', 'intern')
+                input_selector = search_analysis.get('search_input_selector', '')
+                submit_selector = search_analysis.get('search_submit_selector', '')
                 
-                for selector in filter(None, selectors):
+                self.logger.info(f"Search query: '{search_query}'")
+                self.logger.info(f"Input selector: {input_selector}")
+                self.logger.info(f"Submit selector: {submit_selector}")
+                
+                # Fill search field
+                if not input_selector or not page.query_selector(input_selector):
+                    self.logger.warning("Search input selector not found")
+                    return None
+                
+                page.fill(input_selector, search_query)
+                self.logger.info("Filled search field")
+                
+                # Submit search
+                original_url = page.url
+                
+                if submit_selector and page.query_selector(submit_selector):
+                    # Try JavaScript click to bypass overlays
                     try:
-                        page.fill(selector, getattr(self, 'search_query', 'intern'))
-                        page.press(selector, 'Enter')
-                        time.sleep(2)
-                        new_url = page.url
-                        if new_url != url:
-                            browser.close()
-                            return {'search_performed': True, 'new_url': new_url}
-                    except:
-                        continue
+                        page.evaluate(f"document.querySelector('{submit_selector}').click()")
+                        self.logger.info("Clicked submit element with JavaScript")
+                    except Exception:
+                        # Fallback to regular click
+                        page.click(submit_selector)
+                        self.logger.info("Clicked submit element normally")
+                else:
+                    # Fallback: Try Enter key
+                    page.press(input_selector, 'Enter')
+                    self.logger.info("Used Enter key fallback")
+                
+                # Wait for JavaScript/SPA to execute
+                time.sleep(10)
+                
+                # Ask LLM if we successfully reached job listings
+                rendered_content = page.evaluate("document.documentElement.outerHTML")
+                if self._llm_verify_search_success(rendered_content, page.url):
+                    self.logger.info(f"Search successful: {original_url} -> {page.url}")
+                    return {'search_performed': True, 'new_url': page.url}
+                else:
+                    self.logger.warning("Search did not produce job listings")
+                    return None
                         
-                browser.close()
-                return None
+            finally:
+                page.close()
         except Exception as e:
-            raise Exception(f"Failed to perform search on {url}: {str(e)}")
+            self.logger.error(f"Failed to perform search: {str(e)}")
+            return None
+    
+    def _llm_verify_search_success(self, page_content: str, current_url: str) -> bool:
+        """Ask LLM if we successfully reached job listings after search."""
+        try:
+            # Clean and limit content for LLMcl
+            content_data = self._extract_clean_content_and_links(page_content, current_url)
+            visible_text = content_data['visible_text'][:5000]  # Smaller limit for quick check
+            
+            prompt = f"""Did this search successfully load job listings?
+
+URL: {current_url}
+
+PAGE CONTENT:
+{visible_text}
+
+Return ONLY "YES" if you see actual job listings with titles, locations, or apply buttons.
+Return ONLY "NO" if you see search forms, filters, or general program descriptions without specific job postings."""
+
+            response = self._llm_query(prompt).upper().strip()
+            success = response == "YES"
+            self.logger.info(f"LLM search verification: {response} -> {success}")
+            return success
+            
+        except Exception as e:
+            self.logger.warning(f"LLM search verification failed: {str(e)}")
+            return False
     
     def _get_page_content(self, url: str) -> Optional[str]:
         """Get page content using Playwright with Firefox and anti-detection."""
@@ -380,19 +507,20 @@ Return needs_search: true if page shows mostly non-internship jobs and search wo
             return self._content_cache[url]
         
         import time
-        
         try:
-            p, browser, page = self._playwright_browser(full_config=True)
-            with p:
+            page = self._new_page()
+            try:
                 time.sleep(3)
                 page.goto(url, wait_until='networkidle', timeout=60000)
                 page.wait_for_load_state("networkidle")
                 time.sleep(5)
                 
-                content = page.content()
-                browser.close()
+                # Get rendered DOM instead of raw HTML source
+                content = page.evaluate("document.documentElement.outerHTML")
                 self._content_cache[url] = content
                 return content
+            finally:
+                page.close()
                 
         except Exception as e:
             raise Exception(f"Failed to get page content for {url}: {str(e)}")
@@ -406,7 +534,7 @@ Return needs_search: true if page shows mostly non-internship jobs and search wo
         # Limit HTML to first 500,000 characters to avoid token limits
         if len(html_structure) > 500000:
             html_structure = html_structure[:500000]
-            self.logger.info(f"HTML truncated to 300,000 characters for LLM analysis")
+            self.logger.info(f"HTML truncated to 500,000 characters for LLM analysis")
 
         system_prompt = """You are an expert web scraper analyzer. Analyze internship job board pages and identify the best way to scrape job listings.
 
@@ -416,7 +544,7 @@ You MUST return ONLY a valid JSON object with these exact keys:
 {
   "job_container_selector": "CSS selector for individual job listings (e.g., \".cmp-jobcard\")",
   "title_selector": "CSS selector for job titles relative to container (e.g., \".cmp-jobcard__title\")",
-  "url_selector": "CSS selector for job links relative to container (e.g., \"a\")",
+    "url_selector": "CSS selector for job links relative to container (e.g., \"a\") OR empty string \"\" if container itself has href",
   "description_selector": "CSS selector for descriptions if available (e.g., \".description_text\")",
   "location_selector": "CSS selector for locations if available (e.g., \".cmp-jobcard__location\")",
   "pagination_selector": "CSS selector for pagination/next page (e.g., \".next\")",
@@ -565,65 +693,80 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
             return {"error": f"AI analysis failed: {str(e)}"}
     
     def _validate_complete_config(self, analysis: Dict, url: str, html_structure: str) -> Dict:
-        """LLM-focused validation: gather all test results and let LLM evaluate."""
-        self.logger.info("Starting LLM-focused config validation...")
+        """
+        Use PlaywrightScraper to validate the configuration.
+        
+        This delegates to PlaywrightScraper for consistent validation behavior,
+        ensuring the same scraping logic is used for both validation and production.
+        """
+        self.logger.info("Starting PlaywrightScraper-based config validation...")
         
         try:
-            # Import here to avoid circular imports
-            from playwright_scraper import PlaywrightScraperSync
-            scraper = PlaywrightScraperSync()
-
-            # Test job extraction (this also tests selectors)
-            test_config = {
-                'company_name': 'TestCompany',
-                'scrape_url': url,
-                'job_container_selector': analysis.get('job_container_selector', ''),
-                'title_selector': analysis.get('title_selector', ''),
-                'url_selector': analysis.get('url_selector', ''),
-                'description_selector': analysis.get('description_selector', ''),
-                'location_selector': analysis.get('location_selector', ''),
-                'pagination_selector': analysis.get('pagination_selector', ''),
-                'has_dynamic_loading': analysis.get('has_dynamic_loading', False),
-                'max_pages': 1
-            }
+            # Run PlaywrightScraper in a separate thread to avoid event loop conflicts
+            import concurrent.futures
+            import threading
             
-            jobs, _ = scraper.scrape_jobs(url, test_config)
-            
-            # Create mock selector results based on job extraction success
-            selector_results = {
-                'url': url,
-                'test_time': datetime.now().isoformat(),
-                'results': {
-                    'job_container_selector': {
-                        'selector': analysis.get('job_container_selector', ''),
-                        'elements_found': len(jobs),
-                        'success': len(jobs) > 0
-                    },
-                    'title_selector': {
-                        'selector': analysis.get('title_selector', ''),
-                        'success': any(job.get('title', '').strip() for job in jobs)
-                    },
-                    'url_selector': {
-                        'selector': analysis.get('url_selector', ''),
-                        'success': any(job.get('url', '').strip() for job in jobs)
-                    }
+            def run_playwright_validation():
+                # Create a PlaywrightScraper instance for testing
+                playwright_scraper = PlaywrightScraperSync(use_database=False)
+                
+                # Test selectors using PlaywrightScraper's test_selectors method
+                selectors_to_test = {
+                    'job_container_selector': analysis.get('job_container_selector', ''),
+                    'title_selector': analysis.get('title_selector', ''),
+                    'url_selector': analysis.get('url_selector', ''),
+                    'description_selector': analysis.get('description_selector', ''),
+                    'location_selector': analysis.get('location_selector', ''),
+                    'pagination_selector': analysis.get('pagination_selector', '')
                 }
-            }
+                
+                # Remove empty selectors
+                selectors_to_test = {k: v for k, v in selectors_to_test.items() if v}
+                
+                selector_results = playwright_scraper.test_selectors(url, selectors_to_test)
+                
+                # Create a test scraper config to extract sample jobs
+                test_config = {
+                    'company_name': analysis.get('company_name', 'Test Company'),
+                    'job_container_selector': analysis.get('job_container_selector', ''),
+                    'title_selector': analysis.get('title_selector', ''),
+                    'url_selector': analysis.get('url_selector', ''),
+                    'description_selector': analysis.get('description_selector', ''),
+                    'location_selector': analysis.get('location_selector', ''),
+                    'pagination_selector': analysis.get('pagination_selector', ''),
+                    'max_pages': 1  # Only test first page for validation
+                }
+                
+                # Extract sample jobs using PlaywrightScraper
+                jobs, _ = playwright_scraper.scrape_jobs(url, test_config)
+                
+                return selector_results, jobs
             
-            # Simple pagination test - just check if selector exists and jobs were found
+            # Run in thread to avoid asyncio event loop conflict
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(run_playwright_validation)
+                selector_results, jobs = future.result(timeout=120)  # 2 minute timeout
+            
+            self.logger.info(f"PlaywrightScraper validation completed successfully")
+            self.logger.info(f"PlaywrightScraper extracted {len(jobs)} sample jobs for validation")
+            
+            # Create pagination test results based on selector test
             pagination_test = {}
             if analysis.get('pagination_selector'):
+                pagination_results = selector_results.get('results', {}).get('pagination_selector', {})
                 pagination_test = {
                     "pagination_selector": analysis.get('pagination_selector', ''),
                     "jobs_found": len(jobs),
                     "test_attempted": True,
-                    "success": len(jobs) > 0
+                    "success": pagination_results.get('success', False),
+                    "elements_found": pagination_results.get('elements_found', 0)
                 }
             
             # Let LLM evaluate all results
             return self._llm_evaluate_config(analysis, selector_results, jobs, pagination_test, html_structure, url)
             
         except Exception as e:
+            self.logger.error(f"PlaywrightScraper validation failed: {str(e)}")
             return {"success": False, "error": f"Validation failed: {str(e)}"}
     
     
@@ -636,9 +779,9 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
             html_structure = html_structure[:200000]
         
         # Prepare job sample
-        job_sample = jobs[:5] if jobs else []
+        job_sample = jobs[:3] if jobs else []
         
-        system_prompt = """You are evaluating a job scraper configuration. Analyze the test results and determine if the config is good or needs improvement.
+        system_prompt = """You are evaluating a job scraper configuration. Analyze the test results and determine if the config is good or needs improvement. You have been fed the first 3 jobs extracted as a sample.
 
 Return ONLY a valid JSON object with these exact keys:
 {
@@ -691,6 +834,7 @@ HTML STRUCTURE (for reference):
 Evaluate the configuration quality and recommend if retry is needed."""
 
         try:
+            print(json.dumps(job_sample, indent=2))
             evaluation = json.loads(self._llm_query(f"{system_prompt}\n\n{user_prompt}", json_response=True))
             self.logger.info(f"LLM evaluation: {evaluation.get('success')}")
             return evaluation
@@ -728,123 +872,39 @@ Evaluate the configuration quality and recommend if retry is needed."""
         """Generate a standalone Python script that uses PlaywrightScraper."""
         scrape_url = analysis.get("final_url", url)
         
-        script_template = f'''#!/usr/bin/env python3
-"""
-Playwright-based job scraper for {company_name}
-Generated automatically by AI Navigator
-URL: {scrape_url}
-Generated at: {datetime.now().isoformat()}
-"""
-
-import json
-import logging
-import sys
-import os
-from datetime import datetime
-
-# Add the parent directory to the path to import our modules
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from playwright_scraper import PlaywrightScraperSync
-from database import DatabaseManager
-
-
-def setup_logging():
-    """Setup logging for the scraper."""
-    import os
-    os.makedirs('logs', exist_ok=True)
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(f'logs/{company_name.lower().replace(" ", "_")}_scraper.log'),
-            logging.StreamHandler()
-        ]
-    )
-
-
-def get_scraper_config():
-    """Get the scraper configuration for {company_name}."""
-    return {{
-        'company_name': '{company_name}',
-        'scrape_url': '{scrape_url}',
-        'job_container_selector': '{analysis.get("job_container_selector", "")}',
-        'title_selector': '{analysis.get("title_selector", "")}',
-        'url_selector': '{analysis.get("url_selector", "")}',
-        'description_selector': '{analysis.get("description_selector", "")}',
-        'location_selector': '{analysis.get("location_selector", "")}',
-        'requirements_selector': '{analysis.get("requirements_selector", "")}',
-        'pagination_selector': '{analysis.get("pagination_selector", "")}',
-        'has_dynamic_loading': {str(analysis.get("has_dynamic_loading", False))},
-        'max_pages': 999  # Unlimited - will stop automatically based on end conditions
-    }}
-
-def main():
-    """Main scraper function."""
-    setup_logging()
-    logger = logging.getLogger(__name__)
-    
-    logger.info("Starting {company_name} job scraper...")
-    
-    config = get_scraper_config()
-    
-    # Initialize database-enabled scraper
-    scraper = PlaywrightScraperSync(use_database=True)
-    db_manager = DatabaseManager()
-    
-    # Get company info from database
-    company = db_manager.get_company_by_name('{company_name}')
-    if not company:
-        logger.error("Company '{company_name}' not found in database")
-        print("Error: Company not found in database. Please add the company first.")
-        return
-    
-    # Update last scraped timestamp
-    db_manager.update_company_scraper(company['id'], "")
-    
-    # Scrape jobs and get filtered HTML
-    jobs, filtered_html = scraper.scrape_jobs(config['scrape_url'], config)
-    
-    if jobs:
-        logger.info(f"Successfully scraped {{len(jobs)}} jobs from {company_name}")
+        # Read the template file
+        template_path = os.path.join(os.path.dirname(__file__), 'scraper_template.py')
+        try:
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template_content = f.read()
+        except FileNotFoundError:
+            self.logger.error(f"Template file not found: {template_path}")
+            raise FileNotFoundError(f"Scraper template file not found at {template_path}")
         
-        # Print summary
-        print(f"\\n=== SCRAPING RESULTS ===")
-        print(f"Company: {company_name}")
-        print(f"URL: {scrape_url}")
-        print(f"Jobs found: {{len(jobs)}}")
-        print(f"Jobs saved to database: jobs.db")
+        # Prepare template variables
+        template_vars = {
+            'company_name': company_name,
+            'scrape_url': scrape_url,
+            'generated_at': datetime.now().isoformat(),
+            'log_filename': f"{company_name.lower().replace(' ', '_')}_scraper.log",
+            'job_container_selector': analysis.get('job_container_selector', ''),
+            'title_selector': analysis.get('title_selector', ''),
+            'url_selector': analysis.get('url_selector', ''),
+            'description_selector': analysis.get('description_selector', ''),
+            'location_selector': analysis.get('location_selector', ''),
+            'requirements_selector': analysis.get('requirements_selector', ''),
+            'pagination_selector': analysis.get('pagination_selector', ''),
+            'has_dynamic_loading': str(analysis.get('has_dynamic_loading', False)),
+            'backup_filename': f"{company_name.lower().replace(' ', '_')}_jobs_{int(datetime.now().timestamp())}.json"
+        }
         
-        # Show sample jobs
-        print(f"\\n=== SAMPLE JOBS ===")
-        for i, job in enumerate(jobs[:3], 1):
-            print(f"{{i}}. {{job.get('title', 'No title')}}")
-            print(f"   Location: {{job.get('location', 'Not specified')}}")
-            print(f"   URL: {{job.get('url', 'No URL')}}")
-            print()
-            
-        # Optional: Also save as JSON backup if needed
-        # output_file = f'{company_name.lower().replace(" ", "_")}_jobs_{{int(datetime.now().timestamp())}}.json'
-        # with open(output_file, 'w', encoding='utf-8') as f:
-        #     json.dump(jobs, f, indent=2, ensure_ascii=False)
-        # print(f"Backup JSON saved to: {{output_file}}")
-        
-    else:
-        logger.warning("No jobs found - scraper may need adjustment")
-        print("No jobs found. The scraper configuration may need to be adjusted.")
-        
-        # Log failed scraper execution
-        db_manager.log_scraper_execution(
-            company['id'], 
-            0, 
-            success=False,
-            error_message="No jobs found"
-        )
-
-
-if __name__ == "__main__":
-    main()
-'''
-        
-        return script_template
+        # Fill in the template
+        try:
+            generated_script = template_content.format(**template_vars)
+            return generated_script
+        except KeyError as e:
+            self.logger.error(f"Missing template variable: {e}")
+            raise ValueError(f"Template variable missing: {e}")
+        except Exception as e:
+            self.logger.error(f"Error generating script from template: {e}")
+            raise RuntimeError(f"Script generation failed: {e}")

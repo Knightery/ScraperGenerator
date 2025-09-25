@@ -246,6 +246,15 @@ class DatabaseManager:
             ''', (company_id, limit))
             return [dict(row) for row in cursor.fetchall()]
     
+    def get_existing_job_urls(self, company_id: int) -> set:
+        """Get all existing job URLs for a company to check for duplicates during scraping."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT url FROM jobs WHERE company_id = ?
+            ''', (company_id,))
+            return {row[0] for row in cursor.fetchall() if row[0]}  # Return set of URLs
+    
     def log_scraper_execution(self, company_id: int, jobs_found: int, 
                             success: bool, error_message: str = None):
         """Log scraper execution results."""

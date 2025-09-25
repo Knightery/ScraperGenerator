@@ -1,9 +1,10 @@
 import requests
-import json
 import logging
 from typing import List, Dict, Optional
-from urllib.parse import urljoin, urlparse
 from config import Config
+from google import genai
+import os
+from dotenv import load_dotenv
 
 class SearchEngine:
     """Handles company job board discovery using Brave Search API."""
@@ -93,23 +94,19 @@ class SearchEngine:
         return fallback_url
     
     def _select_best_url_with_ai(self, results: List[Dict], company_name: str) -> Optional[str]:
-        """Use DeepSeek AI to select the best URL for internship job listings."""
+        """Use Gemini AI to select the best URL for internship job listings."""
         try:
             # Import here to avoid circular imports
-            import openai
             
-            # Get DeepSeek API key from config
-            from config import Config
+            load_dotenv()
             
-            if not Config.DEEPSEEK_API_KEY:
-                self.logger.warning("DEEPSEEK_API_KEY not found, falling back to first result")
+            gemini_api_key = os.getenv('GEMINI_API_KEY')
+            if not gemini_api_key:
+                self.logger.warning("GEMINI_API_KEY not found, falling back to first result")
                 return results[0].get('url') if results else None
             
-            # Configure OpenAI client for DeepSeek
-            client = openai.OpenAI(
-                api_key=Config.DEEPSEEK_API_KEY,
-                base_url="https://api.deepseek.com/v1"
-            )
+            # Configure Gemini client
+            client = genai.Client(api_key=gemini_api_key)
             
             # Prepare search results for AI analysis
             results_text = ""
@@ -122,7 +119,7 @@ class SearchEngine:
                 results_text += f"   Title: {title}\n"
                 results_text += f"   Description: {description}\n\n"
             
-            system_prompt = f"""You are an expert at identifying the best job board URLs for internship listings.
+            prompt = f"""You are an expert at identifying the best job board URLs for internship listings.
 
 Your task is to analyze search results and select the BEST URL that will lead to {company_name}'s internship job listings.
 
@@ -138,44 +135,44 @@ Avoid URLs from:
 - Blog posts or news articles
 - Social media pages
 
-Return ONLY the number (1-{len(results)}) of the best result. If none are suitable, return "0"."""
-
-            user_prompt = f"""Select the best URL for finding {company_name} internship job listings:
+Select the best URL for finding {company_name} internship job listings:
 
 {results_text}
 
-Return only the number of the best result (1-{len(results)}) or "0" if none are suitable."""
+Return ONLY the number (1-{len(results)}) of the best result. If none are suitable, return "0"."""
 
-            response = client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1,
-                max_tokens=10
-            )
-            
-            response_text = response.choices[0].message.content.strip()
-            
-            # Parse the response
-            try:
-                selection = int(response_text)
-                if 1 <= selection <= len(results):
-                    selected_result = results[selection - 1]
-                    selected_url = selected_result.get('url')
-                    self.logger.info(f"AI selected result #{selection}: {selected_url}")
-                    self.logger.info(f"Selected title: {selected_result.get('title', 'N/A')}")
-                    return selected_url
-                elif selection == 0:
-                    self.logger.warning("AI determined no results are suitable")
-                    return None
-                else:
-                    self.logger.warning(f"AI returned invalid selection: {selection}")
-                    return None
-            except ValueError:
-                self.logger.warning(f"AI returned non-numeric response: {response_text}")
-                return None
+            # Retry up to 2 times for non-numeric responses
+            max_retries = 2
+            for attempt in range(max_retries + 1):
+                response = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt
+                )
+                
+                response_text = response.text.strip()
+                
+                # Parse the response
+                try:
+                    selection = int(response_text)
+                    if 1 <= selection <= len(results):
+                        selected_result = results[selection - 1]
+                        selected_url = selected_result.get('url')
+                        self.logger.info(f"AI selected result #{selection}: {selected_url}")
+                        self.logger.info(f"Selected title: {selected_result.get('title', 'N/A')}")
+                        return selected_url
+                    elif selection == 0:
+                        self.logger.warning("AI determined no results are suitable")
+                        return None
+                    else:
+                        self.logger.warning(f"AI returned invalid selection: {selection}")
+                        return None
+                except ValueError:
+                    if attempt < max_retries:
+                        self.logger.warning(f"AI returned non-numeric response (attempt {attempt + 1}/{max_retries + 1}): {response_text}")
+                        continue
+                    else:
+                        self.logger.warning(f"AI returned non-numeric response after {max_retries + 1} attempts: {response_text}")
+                        return None
                 
         except Exception as e:
             self.logger.error(f"AI URL selection failed: {str(e)}")

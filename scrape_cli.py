@@ -196,7 +196,6 @@ def test_workflow_command(args):
     else:
         print("✗ No jobs found - scraper may need adjustment")
 
-
 def list_companies_command(args):
     """List all companies in the database."""
     print("\n=== Registered Companies ===")
