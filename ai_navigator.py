@@ -35,15 +35,31 @@ class AINavigator:
     Uses PlaywrightScraper for validation and testing of generated scraper configurations.
     """
     
-    def __init__(self):
+    def __init__(self, search_engine=None, company_name=None):
         self.logger = logging.getLogger(__name__)
         self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
         self._page_cache = {}  # Cache for cleaned page content
         self._content_cache = {}  # Cache for raw page content
-        # Browser session for navigation and content fetching
+        self._navigation_history = []  # Track navigation history for back functionality
+        self._rejected_pages = {}  # Track pages that were rejected and why
+        # Persistent browser session for navigation and content fetching
         self._playwright = None
         self._browser = None
         self._context = None
+        self._page = None  # Single persistent page instance
+        # Search engine context for going back to search results
+        self._search_engine = search_engine
+        self._company_name = company_name
+    
+    def __enter__(self):
+        """Context manager entry."""
+        self._start_browser()
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self._close_browser()
+        return False
     
     def _llm_query(self, prompt: str, json_response: bool = False) -> str:
         """Shared LLM query helper."""
@@ -53,13 +69,13 @@ class AINavigator:
         )
         return response.text.strip()
     
-    def _ensure_browser(self):
-        """Ensure browser session is running."""
+    def _start_browser(self):
+        """Start persistent browser session with single page instance."""
         if not self._browser:
-            self.logger.info("Starting new browser session...")
+            self.logger.info("Starting persistent browser session...")
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.firefox.launch(
-                headless=True,
+                headless=True,  # Set to True for production
                 firefox_user_prefs={
                     "javascript.enabled": True,
                     "dom.webdriver.enabled": False,
@@ -69,27 +85,41 @@ class AINavigator:
             )
             self._context = self._browser.new_context(
                 viewport={'width': 1920, 'height': 1080},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0'
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+                # Modern anti-detection settings
+                extra_http_headers={
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+                }
             )
+            
+            # Create single persistent page instance
+            self._page = self._context.new_page()
+            
+            # Enhanced anti-detection setup
+            self._page.add_init_script("""
+                // Remove webdriver property
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                
+                // Remove automation indicators
+                window.chrome = {runtime: {}};
+                Object.defineProperty(navigator, 'permissions', {
+                    get: () => undefined
+                });
+            """)
+            
+            self.logger.info("Persistent browser session initialized")
         else:
-            self.logger.info("Reusing existing browser session...")
-    
-    def _new_page(self):
-        """Get a new page from the shared browser session."""
-        self._ensure_browser()
-        page = self._context.new_page()
-        page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-        return page
+            self.logger.info("Reusing existing persistent browser session")
     
     def _close_browser(self):
-        """Close the browser session."""
-        if self._context:
-            self._context.close()
+        """Close browser session and clean up resources."""
         if self._browser:
             self._browser.close()
         if self._playwright:
             self._playwright.stop()
-        self._playwright = self._browser = self._context = None
+        self._playwright = self._browser = self._context = self._page = None
     
     def _export_cleaned_html(self, cleaned_html: str, url: str):
         """Export cleaned HTML to file for debugging."""
@@ -135,18 +165,39 @@ class AINavigator:
             content_data = self._extract_clean_content_and_links(page_content, internship_url)
             html_structure = content_data['cleaned_html']
             
-            # Check for search bar and interact if needed
-            search_result = self._handle_search_bar_interaction(internship_url, page_content)
-            if search_result and search_result.get('new_url'):
-                # URL changed after search, update our target URL and get new content
-                internship_url = search_result['new_url']
-                self.logger.info(f"URL changed after search interaction: {internship_url}")
+            # Check for search bar and determine if search is needed for future scraping
+            search_analysis = self._handle_search_bar_interaction(internship_url, page_content, content_data)
+            search_info = {'search_required': False, 'search_input_selector': '', 'search_submit_selector': ''}
+            
+            if search_analysis and search_analysis.get('search_performed'):
+                # Search was successfully performed - this means future scraping needs search
+                search_info['search_required'] = True
+                search_info['search_input_selector'] = search_analysis.get('search_input_selector', '')
+                search_info['search_submit_selector'] = search_analysis.get('search_submit_selector', '')
                 
-                # Get new page content and clean it
-                new_page_content = self._get_page_content(internship_url)
-                if new_page_content:
-                    content_data = self._extract_clean_content_and_links(new_page_content, internship_url)
+                if search_analysis.get('new_url'):
+                    # URL actually changed after search, update our target URL
+                    internship_url = search_analysis['new_url']
+                    self.logger.info(f"URL changed after search interaction: {internship_url}")
+                else:
+                    # Search was performed but URL didn't change - content was updated in place
+                    self.logger.info("Search performed successfully, content updated in place")
+                
+                # Use the fresh content from search result (regardless of URL change)
+                updated_content = search_analysis.get('updated_content')
+                if updated_content:
+                    self.logger.info("Using fresh content from search results")
+                    content_data = self._extract_clean_content_and_links(updated_content, internship_url)
                     html_structure = content_data['cleaned_html']
+                else:
+                    self.logger.warning("No updated content returned from search, fetching fresh content")
+                    # Fallback: clear cache and get fresh content
+                    if internship_url in self._content_cache:
+                        del self._content_cache[internship_url]
+                    new_page_content = self._get_page_content(internship_url)
+                    if new_page_content:
+                        content_data = self._extract_clean_content_and_links(new_page_content, internship_url)
+                        html_structure = content_data['cleaned_html']
             
             # Retry loop for AI analysis and validation only
             previous_feedback = None
@@ -164,7 +215,11 @@ class AINavigator:
                             continue
                         return analysis
                     
+                    # Add search information to analysis (search fields handled separately from AI analysis)
+                    self.logger.info(f"Applying search info: {search_info}")
+                    analysis.update(search_info)
                     analysis["final_url"] = internship_url
+                    self.logger.info(f"Final analysis includes search_required: {analysis.get('search_required', 'MISSING')}")
                     
                     # Validate the generated config
                     validation_result = self._validate_complete_config(analysis, internship_url, html_structure)
@@ -206,6 +261,9 @@ class AINavigator:
         """Navigate from a general careers page to the specific internship page."""
         self.logger.info(f"Starting navigation from: {initial_url}")
         
+        # Initialize navigation history with the starting URL
+        self._navigation_history = [initial_url]
+        
         page_content = self._get_page_content(initial_url)
         if not page_content:
             self.logger.warning("Could not get page content")
@@ -216,14 +274,33 @@ class AINavigator:
         # Have AI decide what to click
         next_url = self._ai_navigate(initial_url, page_content)
         
+        # Check if search engine provided a new URL
+        if next_url and next_url.startswith("SEARCH_ENGINE:"):
+            search_engine_url = next_url[14:]  # Remove "SEARCH_ENGINE:" prefix
+            self.logger.info(f"Search engine provided new URL, restarting navigation: {search_engine_url}")
+            
+            # Reset navigation state and restart with new URL
+            self._navigation_history = []
+            self._rejected_pages = {}
+            self._page_cache = {}
+            self._content_cache = {}
+            
+            # Restart navigation with the new URL
+            return self._find_internship_page(search_engine_url)
+        
         if next_url and next_url != initial_url:
             self.logger.info(f"AI decided to navigate to: {next_url}")
+            # Add to navigation history
+            self._navigation_history.append(next_url)
+            
             # Check if we need to navigate further
             new_page_content = self._get_page_content(next_url)
             if new_page_content:
                 self.logger.info("Got content from new page, checking if we need to navigate further...")
                 final_url = self._ai_evaluate_and_navigate(next_url, new_page_content)
-                if final_url:
+                if final_url and final_url != next_url:
+                    # Add final URL to history if it's different
+                    self._navigation_history.append(final_url)
                     self.logger.info(f"Final navigation destination: {final_url}")
                     return final_url
             return next_url
@@ -234,7 +311,35 @@ class AINavigator:
     
     def _ai_evaluate_and_navigate(self, current_url: str, page_content: str) -> Optional[str]:
         """Evaluate if current page has good internship listings or navigate further."""
-        return self._ai_navigate(current_url, page_content)
+        next_url = self._ai_navigate(current_url, page_content)
+        
+        # Check if search engine provided a new URL
+        if next_url and next_url.startswith("SEARCH_ENGINE:"):
+            search_engine_url = next_url[14:]  # Remove "SEARCH_ENGINE:" prefix
+            self.logger.info(f"Search engine provided new URL during navigation: {search_engine_url}")
+            
+            # Reset navigation state and restart with new URL
+            self._navigation_history = []
+            self._rejected_pages = {}
+            self._page_cache = {}
+            self._content_cache = {}
+            
+            # Restart navigation with the new URL
+            return self._find_internship_page(search_engine_url)
+        
+        # If AI went back to a previous page, continue navigation from there
+        if next_url and next_url != current_url and next_url in self._navigation_history:
+            self.logger.info(f"Continuing navigation from previous page: {next_url}")
+            back_page_content = self._get_page_content(next_url)
+            if back_page_content:
+                return self._ai_evaluate_and_navigate(next_url, back_page_content)
+        
+        # If AI decided to navigate to a different URL (forward navigation), add it to history
+        if next_url and next_url != current_url and next_url not in self._navigation_history:
+            self._navigation_history.append(next_url)
+            self.logger.info(f"Added to navigation history: {next_url}")
+        
+        return next_url
     
     def _extract_clean_content_and_links(self, page_content: str, base_url: str) -> Dict:
         """Extract clean visible text and links from page content by removing irrelevant sections."""
@@ -261,9 +366,7 @@ class AINavigator:
         cleaned_soup = BeautifulSoup(cleaned_html_str, 'html.parser')
         visible_text = cleaned_soup.get_text(separator=' ', strip=True)
         visible_text = ' '.join(visible_text.split())  # Clean whitespace
-        
-        self.logger.info(f"Content cleaned (new size: {len(visible_text):,} chars, reduction: {((len(page_content) - len(visible_text)) / len(page_content) * 100):.1f}%)")
-        
+                
         # Extract links from cleaned content
         links = []
         for link in cleaned_soup.find_all('a', href=True):
@@ -302,7 +405,7 @@ class AINavigator:
         return result
     
     def _ai_navigate(self, current_url: str, page_content: str) -> Optional[str]:
-        """AI navigation method to analyze page and decide whether to stay or navigate."""
+        """AI navigation method to analyze page and decide whether to stay, navigate, or go back."""
         content_data = self._extract_clean_content_and_links(page_content, current_url)
         visible_text = content_data['visible_text']
         links = content_data['links']
@@ -312,7 +415,7 @@ class AINavigator:
             return current_url
         
         # Filter links containing job-related keywords first
-        job_keywords = ['jobs', 'intern', 'oppor', 'careers']  # oppor catches opportunity/opportunities
+        job_keywords = ['jobs', 'intern', 'oppor', 'career']  # oppor catches opportunity/opportunities
         filtered_links = [link for link in links 
                          if any(keyword in link['text'].lower() or keyword in link['url'].lower() 
                                for keyword in job_keywords)]
@@ -324,12 +427,30 @@ class AINavigator:
         links_text = "\n".join(f"{i}. \"{link['text']}\" -> {link['url']}" 
                               for i, link in enumerate(relevant_links, 1))
         
-        prompt = f"""You are analyzing a careers website to find internship job listings.
+        # Always allow BACK navigation
+        can_go_back = len(self._navigation_history) > 1
+        back_option = f"\nBACK: Go back to previous page ({self._navigation_history[-2] if can_go_back else 'search for different website'})"
+        
+        # Build feedback about previously rejected pages
+        rejected_feedback = ""
+        if self._rejected_pages:
+            rejected_info = []
+            for url, reason in self._rejected_pages.items():
+                rejected_info.append(f"- {url}: {reason}")
+            rejected_feedback = f"\n\nPREVIOUSLY REJECTED PAGES (avoid these):\n" + "\n".join(rejected_info)
+        
+        prompt = f"""TASK: Navigate to find internship job listings page.
 
-If you see actual job postings with titles and apply buttons/links, return "STAY".
-If only general information, look for: "View all internships", "Search internship opportunities", "Apply for internships", "Browse positions", "Job search", "Opportunities"
+RETURN LOGIC:
+- "STAY" if you see 3+ internship job titles with apply buttons
+- "BACK" if no internships found or error messages
+- NUMBER (1-N) to click link for internship listings
+- "0" if no relevant links
 
-Return: "STAY", number (1-N) for link to click, or "0" if no relevant links
+INTERNSHIP INDICATORS: "Intern", "Summer", "Co-op", "Graduate Program", "Entry Level"
+AVOID: "VP", "Director", "Senior", "Manager" roles
+
+Context: Website navigation to find scrapable internship listings.
 
 Analyze this careers page: {current_url}
 
@@ -337,274 +458,204 @@ PAGE CONTENT:
 {visible_text[:5000]}
 
 AVAILABLE LINKS TO CLICK:
-{links_text}
+{links_text}{back_option}{rejected_feedback}
 
-Does this page show specific internship job listings, or do I need to click a link to find them?
+Does this page show specific internship job listings, or do I need to click a link to find them, or should I go back?
 
-Response (ONLY return 'STAY', a number 1-N, or '0'):"""
+Response (ONLY return 'STAY', 'BACK', a number 1-N, or '0'):"""
         
-        response_text = self._llm_query(prompt).upper()
-        self.logger.info(f"AI navigation decision: {response_text}")
-        
-        if response_text == "STAY":
-            return current_url
-        
-        try:
-            selection = int(response_text)
-            if 1 <= selection <= len(relevant_links):
-                selected_link = relevant_links[selection - 1]
-                selected_url = selected_link['url']
-                self.logger.info(f"AI selected link {selection}: '{selected_link['text']}' -> {selected_url}")
-                return selected_url
-            elif selection == 0:
-                return current_url
-        except ValueError:
-            pass
+        for attempt in range(3):
+            response_text = self._llm_query(prompt).upper().strip()
+            self.logger.info(f"AI navigation decision: {response_text}")
+            
+            try:
+                if response_text == "STAY":
+                    return current_url
+                elif response_text == "BACK":
+                    # Capture why this page was rejected before going back
+                    rejection_reason = self._get_rejection_reason(current_url, visible_text)
+                    self._rejected_pages[current_url] = rejection_reason
+                    
+                    if can_go_back:
+                        # Use proper browser back navigation instead of URL navigation
+                        self.logger.info(f"AI decided to go BACK using browser back navigation")
+                        
+                        # Use browser's back functionality
+                        self._page.go_back(wait_until='networkidle')
+                        
+                        # Update navigation history to reflect the back navigation
+                        self._navigation_history.pop()  # Remove current URL
+                        back_url = self._page.url
+                        
+                        self.logger.info(f"Browser navigated back to: {back_url}")
+                        
+                        # Update content cache with the back page content
+                        back_content = self._page.content()
+                        self._content_cache[back_url] = back_content
+                        
+                        return back_url
+                    else:
+                        # No history available - this means we're on the first page, show search results
+                        self.logger.info(f"AI wanted to go BACK but no history available. Showing search results.")
+                        
+                        if self._search_engine and self._company_name:
+                            new_url = self._search_engine.search_company_jobs_with_feedback(self._company_name, [{"url": current_url, "reason": rejection_reason}])
+                            if new_url:
+                                self.logger.info(f"Search engine provided new URL: {new_url}")
+                                # Return special marker to indicate this is a search engine URL that needs fresh navigation
+                                return f"SEARCH_ENGINE:{new_url}"
+                        
+                        return current_url
+                else:
+                    selection = int(response_text)
+                    if 1 <= selection <= len(relevant_links):
+                        selected_link = relevant_links[selection - 1]
+                        selected_url = selected_link['url']
+                        self.logger.info(f"AI selected link {selection}: '{selected_link['text']}' -> {selected_url}")
+                        return selected_url
+                    elif selection == 0:
+                        self.logger.info("AI selected 0 - no relevant links")
+                        return current_url
+                    else:
+                        raise ValueError(f"Invalid selection: {selection}")
+            except (ValueError, TypeError) as e:
+                self.logger.warning(f"Failed to parse AI response '{response_text}' (attempt {attempt + 1}/3): {e}")
+                if attempt == 2:  # Last attempt
+                    return current_url
         
         return current_url
     
-    def _handle_search_bar_interaction(self, url: str, page_content: str) -> Optional[Dict]:
+    def _get_rejection_reason(self, url: str, visible_text: str) -> str:
+        """Get a brief reason why the current page was rejected."""
+        prompt = f"""TASK: Explain why this page lacks internship listings.
+
+URL: {url}
+CONTENT: {visible_text[:3000]}
+
+Return 1-2 sentences explaining the issue:"""
+
+        reason = self._llm_query(prompt).strip()
+        return reason if reason else "Page does not contain internship job listings"
+    
+    def _handle_search_bar_interaction(self, url: str, page_content: str, content_data: Dict = None) -> Optional[Dict]:
         """Handle search bar detection and interaction if needed."""
-        search_analysis = self._llm_analyze_search_need(url, page_content)
-        if not search_analysis or not search_analysis.get('needs_search'):
+        search_analysis = self._llm_analyze_search_need(url, page_content, content_data)
+        if not search_analysis or not search_analysis.get('search_required'):
             return None
         return self._perform_search(url, search_analysis)
     
-    def _llm_analyze_search_need(self, url: str, page_content: str) -> Optional[Dict]:
+    def _llm_analyze_search_need(self, url: str, page_content: str, content_data: Dict = None) -> Optional[Dict]:
         """Use LLM to analyze if we need to search and identify search elements."""
-        content_data = self._extract_clean_content_and_links(page_content, url)
+        if content_data is None:
+            content_data = self._extract_clean_content_and_links(page_content, url)
         visible_text = content_data['visible_text'][:8000]
-        html_structure = content_data['cleaned_html'][:100000]  # Limit HTML for analysis
+        html_structure = content_data['cleaned_html'][:100000]
         
-        prompt = f"""Analyze this job board page to determine if search interaction is needed.
+        prompt = f"""TASK: Determine if search is needed to filter for internships only.
+
+REQUIRED: If TRUE, provide EXACT CSS selectors from HTML below.
 
 URL: {url}
+CONTENT: {visible_text}
+HTML: {html_structure}
 
-PAGE CONTENT:
-{visible_text}
-
-HTML STRUCTURE:
-{html_structure}
-
-TASK: Determine if this page shows actual job listings OR needs search interaction.
-
-Return needs_search: FALSE if you see actual job postings with titles and apply buttons.
-Return needs_search: TRUE if you only see search forms, filters, or program descriptions.
-
-If needs_search is TRUE, identify the search elements by examining the HTML:
-
-Return ONLY a valid JSON object:
+Return JSON:
 {{
-  "needs_search": true/false,
-  "search_query": "internship" (or relevant term),
-  "search_input_selector": "exact CSS selector for the search input field",
-  "search_submit_selector": "exact CSS selector for the submit button/link",
-  "reasoning": "brief explanation"
+  "search_required": true/false,
+  "search_query": "internship",
+  "search_input_selector": "exact CSS selector",
+  "search_submit_selector": "exact CSS selector or empty if none, none may allow for enter to submit",
+  "reasoning": "one sentence"
 }}
 
-Guidelines:
-- Analyze the actual HTML structure to find the real selectors
-- search_input_selector: look for input fields with type="text", type="search", or search-related names/ids
-- search_submit_selector: look for buttons, links, or elements that trigger search (could be button, a tag, etc.)
-- Return the EXACT selectors from the HTML, not generic examples"""
+Context: Search interaction for internship-only scraping."""
 
-        try:
-            result = json.loads(self._llm_query(prompt, json_response=True))
-            self.logger.info(f"LLM search analysis: {result.get('reasoning', 'No reasoning provided')}")
-            return result
-        except Exception as e:
-            self.logger.warning(f"LLM search analysis failed: {str(e)}")
-            return None
+        result = json.loads(self._llm_query(prompt, json_response=True))
+        self.logger.info(f"LLM search analysis: {result.get('reasoning', 'No reasoning provided')}")
+        return result
     
     def _perform_search(self, url: str, search_analysis: Dict) -> Optional[Dict]:
-        """Perform search interaction using LLM-identified selectors."""
-        import time
-        try:
-            page = self._new_page()
-            try:
-                page.goto(url, wait_until='networkidle')
-                
-                search_query = search_analysis.get('search_query', 'intern')
-                input_selector = search_analysis.get('search_input_selector', '')
-                submit_selector = search_analysis.get('search_submit_selector', '')
-                
-                self.logger.info(f"Search query: '{search_query}'")
-                self.logger.info(f"Input selector: {input_selector}")
-                self.logger.info(f"Submit selector: {submit_selector}")
-                
-                # Fill search field
-                if not input_selector or not page.query_selector(input_selector):
-                    self.logger.warning("Search input selector not found")
-                    return None
-                
-                page.fill(input_selector, search_query)
-                self.logger.info("Filled search field")
-                
-                # Submit search
-                original_url = page.url
-                
-                if submit_selector and page.query_selector(submit_selector):
-                    # Try JavaScript click to bypass overlays
-                    try:
-                        page.evaluate(f"document.querySelector('{submit_selector}').click()")
-                        self.logger.info("Clicked submit element with JavaScript")
-                    except Exception:
-                        # Fallback to regular click
-                        page.click(submit_selector)
-                        self.logger.info("Clicked submit element normally")
-                else:
-                    # Fallback: Try Enter key
-                    page.press(input_selector, 'Enter')
-                    self.logger.info("Used Enter key fallback")
-                
-                # Wait for JavaScript/SPA to execute
-                time.sleep(10)
-                
-                # Ask LLM if we successfully reached job listings
-                rendered_content = page.evaluate("document.documentElement.outerHTML")
-                if self._llm_verify_search_success(rendered_content, page.url):
-                    self.logger.info(f"Search successful: {original_url} -> {page.url}")
-                    return {'search_performed': True, 'new_url': page.url}
-                else:
-                    self.logger.warning("Search did not produce job listings")
-                    return None
-                        
-            finally:
-                page.close()
-        except Exception as e:
-            self.logger.error(f"Failed to perform search: {str(e)}")
+        """Perform search interaction."""
+        search_query = search_analysis.get('search_query', 'intern')
+        input_selector = search_analysis.get('search_input_selector', '')
+        submit_selector = search_analysis.get('search_submit_selector', '')
+        
+        if not input_selector:
             return None
-    
-    def _llm_verify_search_success(self, page_content: str, current_url: str) -> bool:
-        """Ask LLM if we successfully reached job listings after search."""
-        try:
-            # Clean and limit content for LLMcl
-            content_data = self._extract_clean_content_and_links(page_content, current_url)
-            visible_text = content_data['visible_text'][:5000]  # Smaller limit for quick check
             
-            prompt = f"""Did this search successfully load job listings?
+        # Navigate to page if not already there
+        if self._page is None or self._page.url != url:
+            self._get_page_content(url)
+            
+        original_url = self._page.url
+        
+        # Fill and submit search
+        self._page.fill(input_selector, search_query)
+        
+        if submit_selector:
+            self._page.click(submit_selector)
+        else:
+            self._page.press(input_selector, 'Enter')
+            
+        self._page.wait_for_load_state('networkidle')
+        
+        # Get results
+        current_url = self._page.url
+        content = self._page.content()
+        
+        if self._llm_verify_search_success(content, current_url):
+            self._content_cache[current_url] = content
+            
+            result = {
+                'search_performed': True, 
+                'search_input_selector': input_selector,
+                'search_submit_selector': submit_selector,
+                'updated_content': content
+            }
+            
+            if current_url != original_url:
+                result['new_url'] = current_url
+            
+            return result
+        
+        return None
+       
+    def _llm_verify_search_success(self, page_content: str, current_url: str, content_data: Dict = None) -> bool:
+        """Ask LLM if we successfully reached job listings after search."""
+        if content_data is None:
+            content_data = self._extract_clean_content_and_links(page_content, current_url)
+        visible_text = content_data['visible_text'][:5000]
+        
+        prompt = f"""TASK: Verify search loaded job listings.
 
 URL: {current_url}
+CONTENT: {visible_text}
 
-PAGE CONTENT:
-{visible_text}
+Return "YES" if job titles + apply buttons visible.
+Return "NO" if only search forms or no jobs.
 
-Return ONLY "YES" if you see actual job listings with titles, locations, or apply buttons.
-Return ONLY "NO" if you see search forms, filters, or general program descriptions without specific job postings."""
+Context: Post-search validation."""
 
-            response = self._llm_query(prompt).upper().strip()
-            success = response == "YES"
-            self.logger.info(f"LLM search verification: {response} -> {success}")
-            return success
-            
-        except Exception as e:
-            self.logger.warning(f"LLM search verification failed: {str(e)}")
-            return False
+        response = self._llm_query(prompt).upper().strip()
+        success = response == "YES"
+        self.logger.info(f"LLM search verification: {response} -> {success}")
+        return success
     
     def _get_page_content(self, url: str) -> Optional[str]:
-        """Get page content using Playwright with Firefox and anti-detection."""
+        """Get page content with caching."""
         if url in self._content_cache:
             return self._content_cache[url]
-        
-        import time
-        try:
-            page = self._new_page()
-            try:
-                time.sleep(3)
-                page.goto(url, wait_until='networkidle', timeout=60000)
-                page.wait_for_load_state("networkidle")
-                time.sleep(5)
-                
-                # Get rendered DOM instead of raw HTML source
-                content = page.evaluate("document.documentElement.outerHTML")
-                self._content_cache[url] = content
-                return content
-            finally:
-                page.close()
-                
-        except Exception as e:
-            raise Exception(f"Failed to get page content for {url}: {str(e)}")
+            
+        self._start_browser()
+        self._page.goto(url, wait_until='networkidle')
+        content = self._page.content()
+        self._content_cache[url] = content
+        return content
     
-    def _analyze_with_ai(self, url: str, page_content: str) -> Dict:
-        """Use AI to analyze the job board structure."""
-        # Use the already cleaned HTML from _extract_clean_content_and_links
-        content_data = self._extract_clean_content_and_links(page_content, url)
-        html_structure = content_data['cleaned_html']
-        
-        # Limit HTML to first 500,000 characters to avoid token limits
-        if len(html_structure) > 500000:
-            html_structure = html_structure[:500000]
-            self.logger.info(f"HTML truncated to 500,000 characters for LLM analysis")
-
-        system_prompt = """You are an expert web scraper analyzer. Analyze internship job board pages and identify the best way to scrape job listings.
-
-Use the HTML structure to identify specific CSS selectors for job listings.
-
-You MUST return ONLY a valid JSON object with these exact keys:
-{
-  "job_container_selector": "CSS selector for individual job listings (e.g., \".cmp-jobcard\")",
-  "title_selector": "CSS selector for job titles relative to container (e.g., \".cmp-jobcard__title\")",
-    "url_selector": "CSS selector for job links relative to container (e.g., \"a\") OR empty string \"\" if container itself has href",
-  "description_selector": "CSS selector for descriptions if available (e.g., \".description_text\")",
-  "location_selector": "CSS selector for locations if available (e.g., \".cmp-jobcard__location\")",
-  "pagination_selector": "CSS selector for pagination/next page (e.g., \".next\")",
-  "has_dynamic_loading": true/false (true if the page has dynamic loading, false if it does not)
-}
-
-CRITICAL: 
-- Return ONLY the JSON object, no other text
-- Use actual CSS selectors from the HTML structure
-- Do NOT use placeholder names like "job_container_selector" as values"""
-
-        user_prompt = f"""Analyze this internship job board page:
-
-URL: {url}
-
-HTML STRUCTURE:
-{html_structure}
-
-Identify specific CSS selectors for scraping internship job listings. Look for repeating HTML patterns that contain job titles, locations, and apply links."""
-
-        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
-        
-        response = self.client.models.generate_content(
-            model=gemini_model,
-            contents=combined_prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": JobBoardAnalysis,
-            }
-        )
-        
-        self.logger.info(f"LLM Raw Response: {response.text}")
-        
-        # Use the parsed response directly
-        analysis_obj: JobBoardAnalysis = response.parsed
-        self.logger.info(f"Successfully parsed structured response: {analysis_obj}")
-        
-        # Convert to dict for compatibility with existing code
-        analysis = {
-            "job_container_selector": analysis_obj.job_container_selector,
-            "title_selector": analysis_obj.title_selector,
-            "url_selector": analysis_obj.url_selector,
-            "description_selector": analysis_obj.description_selector,
-            "location_selector": analysis_obj.location_selector,
-            "pagination_selector": analysis_obj.pagination_selector,
-            "has_dynamic_loading": analysis_obj.has_dynamic_loading
-        }
-        
-        return analysis
-    
-    def _analyze_with_ai_and_feedback(self, url: str, html_structure: str, previous_feedback: Dict) -> Dict:
-        """AI analysis with feedback from previous failed attempts."""
-        self.logger.info(f"Re-analyzing with feedback from attempt {previous_feedback['attempt']}")
-        
-        # Limit HTML to avoid token limits
-        if len(html_structure) > 500000:
-            html_structure = html_structure[:500000]
-            self.logger.info("HTML truncated to 500,000 characters for LLM analysis")
-
-        system_prompt = """You are an expert web scraper analyzer. You previously analyzed this page but the selectors didn't work well. 
+    def _generate_analysis_system_prompt(self, is_retry: bool = False) -> str:
+        """Generate system prompt for AI analysis."""
+        if is_retry:
+            return """You are an expert web scraper analyzer. You previously analyzed this page but the selectors didn't work well. 
 
 Based on the feedback, analyze the HTML structure again and provide BETTER CSS selectors for job listings.
 
@@ -619,13 +670,43 @@ You MUST return ONLY a valid JSON object with these exact keys:
   "has_dynamic_loading": true/false (true if the page has dynamic loading, false if it does not)
 }
 
-CRITICAL: 
+CRITICAL SELECTOR REQUIREMENTS:
 - Return ONLY the JSON object, no other text
 - Use actual CSS selectors from the HTML structure
 - Learn from the previous attempt's issues
-- Be more specific/different than the previous selectors that failed"""
+- Be more specific/different than the previous selectors that failed
+- ONLY use CSS2/CSS3 selectors - NO CSS4 selectors like :has(), :contains(), :matches()
+- Use basic selectors: class (.class), id (#id), attribute ([attr=\"value\"]), descendant (div span), child (div > span)
+- If filtering by text content is needed, select the parent container and let the scraper filter by text"""
+        else:
+            return """TASK: Generate CSS selectors for job listing containers.
 
-        user_prompt = f"""RETRY ANALYSIS - Previous attempt failed.
+FOCUS: Find repeating patterns for individual job cards/items.
+GOAL: Scrape ALL job listings (internship filtering happens later).
+
+Return JSON with exact keys:
+{
+  "job_container_selector": "CSS selector for job containers",
+  "title_selector": "CSS selector for titles relative to container", 
+  "url_selector": "CSS selector for links relative to container",
+  "description_selector": "CSS selector for descriptions (or empty)",
+  "location_selector": "CSS selector for locations (or empty)",
+  "pagination_selector": "CSS selector for next page (or empty)",
+  "has_dynamic_loading": true/false
+}
+
+CONSTRAINTS:
+- Use ONLY CSS2/CSS3 selectors
+- NO CSS4 selectors like :has(), :contains()
+- Use actual selectors from HTML, not examples
+- Return ONLY JSON, no other text
+
+Context: CSS selector generation for job scraping."""
+    
+    def _generate_analysis_user_prompt(self, url: str, html_structure: str, previous_feedback: Optional[Dict] = None) -> str:
+        """Generate user prompt for AI analysis."""
+        if previous_feedback:
+            return f"""RETRY ANALYSIS - Previous attempt failed.
 
 URL: {url}
 
@@ -642,18 +723,18 @@ HTML STRUCTURE:
 {html_structure}
 
 Based on this feedback, provide BETTER CSS selectors that will actually work for scraping internship job listings."""
+        else:
+            return f"""Analyze this internship job board page:
 
-        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+URL: {url}
 
-        response = self.client.models.generate_content(
-            model=gemini_model,
-            contents=combined_prompt,
-            config={
-                "response_mime_type": "application/json",
-                "response_schema": JobBoardAnalysis,
-            }
-        )
-        
+HTML STRUCTURE:
+{html_structure}
+
+Identify specific CSS selectors for scraping internship job listings. Look for repeating HTML patterns that contain job titles, locations, and apply links."""
+    
+    def _process_analysis_response(self, response) -> Dict:
+        """Process Gemini API response and convert to dict format."""
         self.logger.info(f"LLM Raw Response: {response.text}")
         
         # Use the parsed response directly
@@ -661,7 +742,7 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
         self.logger.info(f"Successfully parsed structured response: {analysis_obj}")
         
         # Convert to dict for compatibility with existing code
-        analysis = {
+        return {
             "job_container_selector": analysis_obj.job_container_selector,
             "title_selector": analysis_obj.title_selector,
             "url_selector": analysis_obj.url_selector,
@@ -670,8 +751,41 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
             "pagination_selector": analysis_obj.pagination_selector,
             "has_dynamic_loading": analysis_obj.has_dynamic_loading
         }
+    
+    def _analyze_with_ai(self, url: str, html_structure: str, previous_feedback: Optional[Dict] = None) -> Dict:
+        """Unified AI analysis method that handles both initial analysis and retry scenarios with feedback."""
+        # Truncate HTML to manageable size
+        html_structure = html_structure[:500000]
         
-        return analysis
+        # Determine if this is a retry attempt
+        is_retry = previous_feedback is not None
+        
+        if is_retry:
+            self.logger.info(f"Re-analyzing with feedback from attempt {previous_feedback['attempt']}")
+        
+        # Generate prompts based on scenario
+        system_prompt = self._generate_analysis_system_prompt(is_retry)
+        user_prompt = self._generate_analysis_user_prompt(url, html_structure, previous_feedback)
+        combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+        
+        # Make API call with structured response schema
+        try:
+            response = self.client.models.generate_content(
+                model=gemini_model,
+                contents=combined_prompt,
+                config={
+                    "response_mime_type": "application/json",
+                    "response_schema": JobBoardAnalysis,
+                }
+            )
+            
+            # Process and return response
+            return self._process_analysis_response(response)
+        except Exception as e:
+            self.logger.error(f"AI analysis failed: {str(e)}")
+            return {"error": f"AI analysis failed: {str(e)}"}
+    
+
     
     def _wait_before_retry(self, attempt: int):
         """Wait with exponential backoff before retry."""
@@ -681,16 +795,8 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
     
     def _analyze_with_ai_with_feedback(self, url: str, html_structure: str, previous_feedback: Optional[Dict]) -> Dict:
         """AI analysis with feedback from previous attempts."""
-        try:
-            if previous_feedback:
-                # Include feedback from previous attempt
-                return self._analyze_with_ai_and_feedback(url, html_structure, previous_feedback)
-            else:
-                # First attempt, use original method
-                return self._analyze_with_ai(url, html_structure)
-        except Exception as e:
-            self.logger.error(f"AI analysis failed: {str(e)}")
-            return {"error": f"AI analysis failed: {str(e)}"}
+        # The unified _analyze_with_ai method now handles both scenarios
+        return self._analyze_with_ai(url, html_structure, previous_feedback)
     
     def _validate_complete_config(self, analysis: Dict, url: str, html_structure: str) -> Dict:
         """
@@ -704,7 +810,6 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
         try:
             # Run PlaywrightScraper in a separate thread to avoid event loop conflicts
             import concurrent.futures
-            import threading
             
             def run_playwright_validation():
                 # Create a PlaywrightScraper instance for testing
@@ -726,6 +831,7 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
                 selector_results = playwright_scraper.test_selectors(url, selectors_to_test)
                 
                 # Create a test scraper config to extract sample jobs
+                # Note: analysis contains CSS selectors from AI, search fields were added separately
                 test_config = {
                     'company_name': analysis.get('company_name', 'Test Company'),
                     'job_container_selector': analysis.get('job_container_selector', ''),
@@ -734,8 +840,19 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
                     'description_selector': analysis.get('description_selector', ''),
                     'location_selector': analysis.get('location_selector', ''),
                     'pagination_selector': analysis.get('pagination_selector', ''),
+                    'search_required': analysis.get('search_required', False),  # Added by search detection, not AI
+                    'search_input_selector': analysis.get('search_input_selector', ''),  # Added by search detection, not AI
+                    'search_submit_selector': analysis.get('search_submit_selector', ''),  # Added by search detection, not AI
                     'max_pages': 1  # Only test first page for validation
                 }
+                
+                # DEBUG: Print the full test config including search fields
+                print(f"\n=== DEBUG: TEST CONFIG ===")
+                print(f"URL: {url}")
+                print(f"Config used for validation:")
+                for key, value in test_config.items():
+                    print(f"  {key}: {repr(value)}")
+                print(f"========================\n")
                 
                 # Extract sample jobs using PlaywrightScraper
                 jobs, _ = playwright_scraper.scrape_jobs(url, test_config)
@@ -775,13 +892,12 @@ Based on this feedback, provide BETTER CSS selectors that will actually work for
         self.logger.info("LLM evaluating config results...")
         
         # Limit HTML to avoid token limits
-        if len(html_structure) > 200000:
-            html_structure = html_structure[:200000]
+        html_structure = html_structure[:200000]
         
         # Prepare job sample
         job_sample = jobs[:3] if jobs else []
         
-        system_prompt = """You are evaluating a job scraper configuration. Analyze the test results and determine if the config is good or needs improvement. You have been fed the first 3 jobs extracted as a sample.
+        system_prompt = """You are evaluating a job scraper configuration for INTERNSHIP positions. Analyze the test results and determine if the config is good or needs improvement. You have been fed the first 3 jobs extracted as a sample.
 
 Return ONLY a valid JSON object with these exact keys:
 {
@@ -796,7 +912,6 @@ Evaluation guidelines:
   * Job container selector finds job elements
   * Title selector extracts job titles successfully
   * URL selector extracts valid job links
-  * At least some jobs were extracted with titles and URLs
 
 - OPTIONAL ELEMENTS (empty/missing is acceptable):
   * Description selector - job pages may not have descriptions on listing pages
@@ -805,12 +920,12 @@ Evaluation guidelines:
   * Pagination selector - only needed if site has multiple pages
 
 - EVALUATION FOCUS:
-  * Only flag issues with selectors that are failing to work when they should
+  * Only flag issues with selectors that are failing to work when they should. 
   * Don't penalize empty optional selectors - they may be intentionally empty
-  * Focus on whether the scraper successfully extracts the core job data (title, URL)
+  * Focus on whether the scraper successfully extracts job data (title, URL)
   * Consider the context: listing pages vs detail pages have different available data
 
-Only recommend retry if CRITICAL selectors are broken or no jobs are being extracted."""
+Recommend retry if CRITICAL selectors are broken OR if no jobs are being extracted"""
 
         user_prompt = f"""Evaluate this job scraper configuration:
 
@@ -833,24 +948,12 @@ HTML STRUCTURE (for reference):
 
 Evaluate the configuration quality and recommend if retry is needed."""
 
-        try:
-            print(json.dumps(job_sample, indent=2))
-            evaluation = json.loads(self._llm_query(f"{system_prompt}\n\n{user_prompt}", json_response=True))
-            self.logger.info(f"LLM evaluation: {evaluation.get('success')}")
-            return evaluation
-            
-        except Exception as e:
-            self.logger.error(f"LLM evaluation failed: {str(e)}")
-            # If LLM fails, we must retry - no fallback logic
-            return {
-                "success": False,
-                "issues": ["LLM evaluation failed"],
-                "suggestions": ["Retry analysis"],
-                "retry_recommended": True
-            }
+        evaluation = json.loads(self._llm_query(f"{system_prompt}\n\n{user_prompt}", json_response=True))
+        self.logger.info(f"LLM evaluation: {evaluation.get('success')}")
+        return evaluation
     
-    def generate_scraper_config(self, company_name: str, url: str, analysis: Dict) -> Dict:
-        """Generate Playwright scraper configuration."""
+    def _build_base_config(self, company_name: str, url: str, analysis: Dict) -> Dict:
+        """Build base configuration dictionary with common fields."""
         scrape_url = analysis.get("final_url", url)
         
         return {
@@ -864,9 +967,19 @@ Evaluate the configuration quality and recommend if retry is needed."""
             'requirements_selector': analysis.get('requirements_selector', ''),
             'pagination_selector': analysis.get('pagination_selector', ''),
             'has_dynamic_loading': analysis.get('has_dynamic_loading', False),
+            'search_required': analysis.get('search_required', False),
+            'search_input_selector': analysis.get('search_input_selector', ''),
+            'search_submit_selector': analysis.get('search_submit_selector', ''),
+        }
+    
+    def generate_scraper_config(self, company_name: str, url: str, analysis: Dict) -> Dict:
+        """Generate Playwright scraper configuration."""
+        config = self._build_base_config(company_name, url, analysis)
+        config.update({
             'max_pages': 999,  # Unlimited - will stop automatically based on end conditions
             'created_at': datetime.now().isoformat()
-        }
+        })
+        return config
     
     def generate_scraper_script(self, company_name: str, url: str, analysis: Dict) -> str:
         """Generate a standalone Python script that uses PlaywrightScraper."""
@@ -874,37 +987,20 @@ Evaluate the configuration quality and recommend if retry is needed."""
         
         # Read the template file
         template_path = os.path.join(os.path.dirname(__file__), 'scraper_template.py')
-        try:
-            with open(template_path, 'r', encoding='utf-8') as f:
-                template_content = f.read()
-        except FileNotFoundError:
-            self.logger.error(f"Template file not found: {template_path}")
-            raise FileNotFoundError(f"Scraper template file not found at {template_path}")
+        with open(template_path, 'r', encoding='utf-8') as f:
+            template_content = f.read()
         
-        # Prepare template variables
-        template_vars = {
-            'company_name': company_name,
-            'scrape_url': scrape_url,
+        # Prepare template variables using base config
+        template_vars = self._build_base_config(company_name, url, analysis)
+        
+        # Add template-specific fields
+        template_vars.update({
             'generated_at': datetime.now().isoformat(),
             'log_filename': f"{company_name.lower().replace(' ', '_')}_scraper.log",
-            'job_container_selector': analysis.get('job_container_selector', ''),
-            'title_selector': analysis.get('title_selector', ''),
-            'url_selector': analysis.get('url_selector', ''),
-            'description_selector': analysis.get('description_selector', ''),
-            'location_selector': analysis.get('location_selector', ''),
-            'requirements_selector': analysis.get('requirements_selector', ''),
-            'pagination_selector': analysis.get('pagination_selector', ''),
-            'has_dynamic_loading': str(analysis.get('has_dynamic_loading', False)),
+            'has_dynamic_loading': str(template_vars['has_dynamic_loading']),  # Convert to string for template
+            'search_required': str(template_vars['search_required']),  # Convert to string for template
             'backup_filename': f"{company_name.lower().replace(' ', '_')}_jobs_{int(datetime.now().timestamp())}.json"
-        }
+        })
         
         # Fill in the template
-        try:
-            generated_script = template_content.format(**template_vars)
-            return generated_script
-        except KeyError as e:
-            self.logger.error(f"Missing template variable: {e}")
-            raise ValueError(f"Template variable missing: {e}")
-        except Exception as e:
-            self.logger.error(f"Error generating script from template: {e}")
-            raise RuntimeError(f"Script generation failed: {e}")
+        return template_content.format(**template_vars)

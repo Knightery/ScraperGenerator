@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Playwright-based job scraper for {company_name}
 Generated automatically by AI Navigator
 URL: {scrape_url}
 Generated at: {generated_at}
 """
 
-import json
 import logging
 import sys
 import os
-from datetime import datetime
 
 # Add the parent directory to the path to import our modules
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -35,7 +32,7 @@ def setup_logging():
 
 
 def get_scraper_config():
-    """Get the scraper configuration for {company_name}."""
+    """Get the scraper configuration for {{company_name}}."""
     return {{
         'company_name': '{company_name}',
         'scrape_url': '{scrape_url}',
@@ -47,6 +44,9 @@ def get_scraper_config():
         'requirements_selector': '{requirements_selector}',
         'pagination_selector': '{pagination_selector}',
         'has_dynamic_loading': {has_dynamic_loading},
+        'search_required': {search_required},
+        'search_input_selector': '{search_input_selector}',
+        'search_submit_selector': '{search_submit_selector}',
         'max_pages': 999  # Unlimited - will stop automatically based on end conditions
     }}
 
@@ -66,7 +66,7 @@ def main():
     # Get company info from database
     company = db_manager.get_company_by_name('{company_name}')
     if not company:
-        logger.error("Company '{company_name}' not found in database")
+        logger.error("Company '{{company_name}}' not found in database")
         print("Error: Company not found in database. Please add the company first.")
         return
     
@@ -77,12 +77,12 @@ def main():
     jobs, filtered_html = scraper.scrape_jobs(config['scrape_url'], config)
     
     if jobs:
-        logger.info(f"Successfully scraped {{len(jobs)}} jobs from {company_name}")
+        logger.info(f"Successfully scraped {{len(jobs)}} jobs from '{company_name}'")
         
         # Print summary
         print(f"\\n=== SCRAPING RESULTS ===")
-        print(f"Company: {company_name}")
-        print(f"URL: {scrape_url}")
+        print(f"Company: '{company_name}'")
+        print(f"URL: '{scrape_url}'")
         print(f"Jobs found: {{len(jobs)}}")
         print(f"Jobs saved to database: jobs.db")
         

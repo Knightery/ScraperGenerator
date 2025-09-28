@@ -27,7 +27,7 @@ class Config:
     SCRAPER_VALIDATION_THRESHOLD = float(os.getenv('SCRAPER_VALIDATION_THRESHOLD', 0.8))
     
     # Search Configuration
-    DEFAULT_SEARCH_TERMS = os.getenv('DEFAULT_SEARCH_TERMS', 'internship,careers,jobs').split(',')
+    DEFAULT_SEARCH_TERMS = os.getenv('DEFAULT_SEARCH_TERMS', 'student summer internship,careers,jobs').split(',')
     
     # Scrapy Settings
     SCRAPY_SETTINGS = {

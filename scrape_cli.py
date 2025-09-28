@@ -9,15 +9,12 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
-from typing import Dict, List, Optional
 
 from main_scraper import CompanyJobScraper
 from database import DatabaseManager
 from search_engine import SearchEngine
 from ai_navigator import AINavigator
 from playwright_scraper import PlaywrightScraperSync
-
 
 def setup_logging(verbose: bool = False):
     """Setup logging for the CLI."""
@@ -30,7 +27,6 @@ def setup_logging(verbose: bool = False):
             logging.StreamHandler()
         ]
     )
-
 
 def add_company_command(args):
     """Add a new company to the scraping system."""
@@ -86,7 +82,6 @@ def scrape_company_command(args):
         print(f"✗ No jobs found for {args.company}")
         print("The scraper configuration may need adjustment")
 
-
 def test_workflow_command(args):
     """Test the complete workflow with a company."""
     print(f"\n=== Testing Complete Workflow for: {args.company} ===")
@@ -104,7 +99,7 @@ def test_workflow_command(args):
     
     # Step 2: AI navigation and analysis
     print("\n2. AI analyzing job board structure...")
-    ai_navigator = AINavigator()
+    ai_navigator = AINavigator(search_engine=search_engine, company_name=args.company)
     analysis = ai_navigator.analyze_job_board(job_board_url)
     
     if "error" in analysis:

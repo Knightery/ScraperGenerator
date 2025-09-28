@@ -6,7 +6,6 @@ Test script for AI Navigator with LLM-focused retry system
 import sys
 import os
 import logging
-import json
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
