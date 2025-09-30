@@ -450,11 +450,7 @@ def health_check():
         'database': 'connected' if os.path.exists(DB_PATH) else 'not_found'
     })
 
-# Vercel requires this export for serverless functions
-# This is the main entry point for Vercel
-def handler(request, response=None):
-    """Vercel serverless function handler."""
-    return app(request.environ, lambda status, headers: None)
+# Vercel entry point - the app instance is automatically detected
 
 # For local development
 if __name__ == '__main__':
