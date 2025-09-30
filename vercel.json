@@ -1,11 +1,10 @@
 {
-  "version": 2,
-  "env": {
-    "FLASK_APP": "api/index.py"
-  },
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/index.py": {
-      "maxDuration": 30
+      "runtime": "python3.12",
+      "maxDuration": 30,
+      "includeFiles": "your_extra_files/**"
     }
   },
   "rewrites": [
@@ -14,7 +13,7 @@
       "destination": "/static/$1"
     },
     {
-      "source": "/favicon.ico", 
+      "source": "/favicon.ico",
       "destination": "/static/favicon.ico"
     },
     {
