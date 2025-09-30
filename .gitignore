@@ -16,13 +16,6 @@ ENV/
 *.log
 logs/
 
-# Database files
-*.db
-*.sqlite
-*.sqlite3
-database/
-db/
-
 # Python cache
 __pycache__/
 *.py[cod]
