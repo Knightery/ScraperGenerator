@@ -26,6 +26,7 @@ class JobBoardAnalysis(BaseModel):
     location_selector: str
     pagination_selector: str
     has_dynamic_loading: bool
+    text_filter_keywords: str
 
 class AINavigator:
     """
@@ -167,13 +168,14 @@ class AINavigator:
             
             # Check for search bar and determine if search is needed for future scraping
             search_analysis = self._handle_search_bar_interaction(internship_url, page_content, content_data)
-            search_info = {'search_required': False, 'search_input_selector': '', 'search_submit_selector': ''}
+            search_info = {'search_required': False, 'search_input_selector': '', 'search_submit_selector': '', 'search_query': 'intern'}
             
             if search_analysis and search_analysis.get('search_performed'):
                 # Search was successfully performed - this means future scraping needs search
                 search_info['search_required'] = True
                 search_info['search_input_selector'] = search_analysis.get('search_input_selector', '')
                 search_info['search_submit_selector'] = search_analysis.get('search_submit_selector', '')
+                search_info['search_query'] = search_analysis.get('search_query', 'intern')
                 
                 if search_analysis.get('new_url'):
                     # URL actually changed after search, update our target URL
@@ -551,9 +553,11 @@ Return 1-2 sentences explaining the issue:"""
         visible_text = content_data['visible_text'][:8000]
         html_structure = content_data['cleaned_html'][:100000]
         
-        prompt = f"""TASK: Determine if search is needed to filter for internships only.
+        prompt = f"""TASK: Determine if search or button interaction is needed to filter for internships only.
 
-REQUIRED: If TRUE, provide EXACT CSS selectors from HTML below.
+REQUIRED: If TRUE, provide EXACT CSS selectors from HTML below. Support two interaction types:
+1. SEARCH BAR: Provide search_query + search_input_selector + optional search_submit_selector
+2. BUTTON ONLY: Provide only search_submit_selector (for buttons like "Internships", "Graduate Programs")
 
 URL: {url}
 CONTENT: {visible_text}
@@ -562,25 +566,36 @@ HTML: {html_structure}
 Return JSON:
 {{
   "search_required": true/false,
-  "search_query": "internship",
-  "search_input_selector": "exact CSS selector",
-  "search_submit_selector": "exact CSS selector or empty if none, none may allow for enter to submit",
-  "reasoning": "one sentence"
+  "search_query": "search term for search bars (e.g. 'intern', 'summer analyst') OR empty string if button-only interaction",
+  "search_input_selector": "exact CSS selector for search input OR empty string if button-only interaction",
+  "search_submit_selector": "exact CSS selector for submit button OR filter button (e.g. 'Internships' button)",
+  "reasoning": "one sentence explaining the interaction type"
 }}
 
-Context: Search interaction for internship-only scraping."""
+Context: Search/filter interaction for internship-only scraping. Two modes supported:
+- SEARCH MODE: Use search bar with query + input selector + optional submit selector
+- BUTTON MODE: Click filter/category button directly (search_query and search_input_selector will be empty)
+Look for dedicated internship filter buttons, category links, or search functionality."""
 
         result = json.loads(self._llm_query(prompt, json_response=True))
-        self.logger.info(f"LLM search analysis: {result.get('reasoning', 'No reasoning provided')}")
+        self.logger.info(f"LLM search analysis: {result}")
         return result
     
     def _perform_search(self, url: str, search_analysis: Dict) -> Optional[Dict]:
-        """Perform search interaction."""
-        search_query = search_analysis.get('search_query', 'intern')
+        """Perform search or button interaction."""
+        search_query = search_analysis.get('search_query', '')
         input_selector = search_analysis.get('search_input_selector', '')
         submit_selector = search_analysis.get('search_submit_selector', '')
         
-        if not input_selector:
+        # Support two interaction modes:
+        # 1. BUTTON MODE: Only submit_selector provided (e.g., "Internships" filter button)
+        # 2. SEARCH MODE: input_selector + query provided
+        
+        is_button_mode = not input_selector and not search_query and submit_selector
+        is_search_mode = input_selector and search_query
+        
+        if not is_button_mode and not is_search_mode:
+            self.logger.warning("Search analysis provided but insufficient selectors (need either button selector OR input selector + query)")
             return None
             
         # Navigate to page if not already there
@@ -589,13 +604,17 @@ Context: Search interaction for internship-only scraping."""
             
         original_url = self._page.url
         
-        # Fill and submit search
-        self._page.fill(input_selector, search_query)
-        
-        if submit_selector:
-            self._page.click(submit_selector)
-        else:
-            self._page.press(input_selector, 'Enter')
+        # Perform interaction based on mode
+        if is_button_mode:
+            self._page.evaluate(f"document.querySelector('{submit_selector}').click()")
+        elif is_search_mode:
+            # SEARCH MODE: Fill input and submit
+            self._page.fill(input_selector, search_query)
+            
+            if submit_selector:
+                self._page.evaluate(f"document.querySelector('{submit_selector}').click()")
+            else:
+                self._page.press(input_selector, 'Enter')
             
         self._page.wait_for_load_state('networkidle')
         
@@ -603,44 +622,23 @@ Context: Search interaction for internship-only scraping."""
         current_url = self._page.url
         content = self._page.content()
         
-        if self._llm_verify_search_success(content, current_url):
-            self._content_cache[current_url] = content
-            
-            result = {
-                'search_performed': True, 
-                'search_input_selector': input_selector,
-                'search_submit_selector': submit_selector,
-                'updated_content': content
-            }
-            
-            if current_url != original_url:
-                result['new_url'] = current_url
-            
-            return result
+        # Always cache and return results - no verification needed
+        self._content_cache[current_url] = content
         
-        return None
+        result = {
+            'search_performed': True, 
+            'search_input_selector': input_selector,
+            'search_submit_selector': submit_selector,
+            'search_query': search_query,
+            'updated_content': content,
+            'interaction_mode': 'button' if is_button_mode else 'search'
+        }
+        
+        if current_url != original_url:
+            result['new_url'] = current_url
+        
+        return result
        
-    def _llm_verify_search_success(self, page_content: str, current_url: str, content_data: Dict = None) -> bool:
-        """Ask LLM if we successfully reached job listings after search."""
-        if content_data is None:
-            content_data = self._extract_clean_content_and_links(page_content, current_url)
-        visible_text = content_data['visible_text'][:5000]
-        
-        prompt = f"""TASK: Verify search loaded job listings.
-
-URL: {current_url}
-CONTENT: {visible_text}
-
-Return "YES" if job titles + apply buttons visible.
-Return "NO" if only search forms or no jobs.
-
-Context: Post-search validation."""
-
-        response = self._llm_query(prompt).upper().strip()
-        success = response == "YES"
-        self.logger.info(f"LLM search verification: {response} -> {success}")
-        return success
-    
     def _get_page_content(self, url: str) -> Optional[str]:
         """Get page content with caching."""
         if url in self._content_cache:
@@ -667,7 +665,8 @@ You MUST return ONLY a valid JSON object with these exact keys:
   "description_selector": "CSS selector for descriptions if available (e.g., \".description_text\")",
   "location_selector": "CSS selector for locations if available (e.g., \".cmp-jobcard__location\")",
   "pagination_selector": "CSS selector for pagination/next page (e.g., \".next\")",
-  "has_dynamic_loading": true/false (true if the page has dynamic loading, false if it does not)
+  "has_dynamic_loading": true/false (true if the page has dynamic loading, false if it does not),
+  "text_filter_keywords": "comma-separated keywords to filter job titles for internships only (e.g. 'intern,summer,co-op'). Uses substring matching, so 'intern' matches both 'intern' and 'internship'. All keywords checked with OR logic. Leave empty if page only shows internships"
 }
 
 CRITICAL SELECTOR REQUIREMENTS:
@@ -677,12 +676,12 @@ CRITICAL SELECTOR REQUIREMENTS:
 - Be more specific/different than the previous selectors that failed
 - ONLY use CSS2/CSS3 selectors - NO CSS4 selectors like :has(), :contains(), :matches()
 - Use basic selectors: class (.class), id (#id), attribute ([attr=\"value\"]), descendant (div span), child (div > span)
-- If filtering by text content is needed, select the parent container and let the scraper filter by text"""
+- If page shows mixed job types, provide text_filter_keywords to filter for internships using Playwright"""
         else:
             return """TASK: Generate CSS selectors for job listing containers.
 
 FOCUS: Find repeating patterns for individual job cards/items.
-GOAL: Scrape ALL job listings (internship filtering happens later).
+GOAL: Scrape internship job listings efficiently.
 
 Return JSON with exact keys:
 {
@@ -692,7 +691,8 @@ Return JSON with exact keys:
   "description_selector": "CSS selector for descriptions (or empty)",
   "location_selector": "CSS selector for locations (or empty)",
   "pagination_selector": "CSS selector for next page (or empty)",
-  "has_dynamic_loading": true/false
+  "has_dynamic_loading": true/false,
+  "text_filter_keywords": "comma-separated keywords to filter job titles for internships only (e.g. 'intern,summer,co-op'). Uses substring matching, so 'intern' matches both 'intern' and 'internship'. All keywords checked with OR logic. Leave empty if page already shows only internships"
 }
 
 CONSTRAINTS:
@@ -700,6 +700,8 @@ CONSTRAINTS:
 - NO CSS4 selectors like :has(), :contains()
 - Use actual selectors from HTML, not examples
 - Return ONLY JSON, no other text
+- If page shows ALL job types mixed together, provide keywords that identify internships from visible job titles
+- If page already shows only internships (via search/filter), leave text_filter_keywords empty
 
 Context: CSS selector generation for job scraping."""
     
@@ -749,7 +751,8 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
             "description_selector": analysis_obj.description_selector,
             "location_selector": analysis_obj.location_selector,
             "pagination_selector": analysis_obj.pagination_selector,
-            "has_dynamic_loading": analysis_obj.has_dynamic_loading
+            "has_dynamic_loading": analysis_obj.has_dynamic_loading,
+            "text_filter_keywords": analysis_obj.text_filter_keywords
         }
     
     def _analyze_with_ai(self, url: str, html_structure: str, previous_feedback: Optional[Dict] = None) -> Dict:
@@ -785,8 +788,6 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
             self.logger.error(f"AI analysis failed: {str(e)}")
             return {"error": f"AI analysis failed: {str(e)}"}
     
-
-    
     def _wait_before_retry(self, attempt: int):
         """Wait with exponential backoff before retry."""
         wait_time = min(2 ** attempt, 30)  # Cap at 30 seconds
@@ -815,22 +816,6 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
                 # Create a PlaywrightScraper instance for testing
                 playwright_scraper = PlaywrightScraperSync(use_database=False)
                 
-                # Test selectors using PlaywrightScraper's test_selectors method
-                selectors_to_test = {
-                    'job_container_selector': analysis.get('job_container_selector', ''),
-                    'title_selector': analysis.get('title_selector', ''),
-                    'url_selector': analysis.get('url_selector', ''),
-                    'description_selector': analysis.get('description_selector', ''),
-                    'location_selector': analysis.get('location_selector', ''),
-                    'pagination_selector': analysis.get('pagination_selector', '')
-                }
-                
-                # Remove empty selectors
-                selectors_to_test = {k: v for k, v in selectors_to_test.items() if v}
-                
-                selector_results = playwright_scraper.test_selectors(url, selectors_to_test)
-                
-                # Create a test scraper config to extract sample jobs
                 # Note: analysis contains CSS selectors from AI, search fields were added separately
                 test_config = {
                     'company_name': analysis.get('company_name', 'Test Company'),
@@ -843,6 +828,7 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
                     'search_required': analysis.get('search_required', False),  # Added by search detection, not AI
                     'search_input_selector': analysis.get('search_input_selector', ''),  # Added by search detection, not AI
                     'search_submit_selector': analysis.get('search_submit_selector', ''),  # Added by search detection, not AI
+                    'search_query': analysis.get('search_query', 'intern'),  # Added by search detection, not AI
                     'max_pages': 1  # Only test first page for validation
                 }
                 
@@ -857,37 +843,25 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
                 # Extract sample jobs using PlaywrightScraper
                 jobs, _ = playwright_scraper.scrape_jobs(url, test_config)
                 
-                return selector_results, jobs
+                return jobs
             
             # Run in thread to avoid asyncio event loop conflict
             with concurrent.futures.ThreadPoolExecutor() as executor:
                 future = executor.submit(run_playwright_validation)
-                selector_results, jobs = future.result(timeout=120)  # 2 minute timeout
+                jobs = future.result(timeout=120)  # 2 minute timeout
             
             self.logger.info(f"PlaywrightScraper validation completed successfully")
             self.logger.info(f"PlaywrightScraper extracted {len(jobs)} sample jobs for validation")
             
-            # Create pagination test results based on selector test
-            pagination_test = {}
-            if analysis.get('pagination_selector'):
-                pagination_results = selector_results.get('results', {}).get('pagination_selector', {})
-                pagination_test = {
-                    "pagination_selector": analysis.get('pagination_selector', ''),
-                    "jobs_found": len(jobs),
-                    "test_attempted": True,
-                    "success": pagination_results.get('success', False),
-                    "elements_found": pagination_results.get('elements_found', 0)
-                }
-            
-            # Let LLM evaluate all results
-            return self._llm_evaluate_config(analysis, selector_results, jobs, pagination_test, html_structure, url)
+            # Let LLM evaluate the results
+            return self._llm_evaluate_config(analysis, jobs, html_structure, url)
             
         except Exception as e:
             self.logger.error(f"PlaywrightScraper validation failed: {str(e)}")
             return {"success": False, "error": f"Validation failed: {str(e)}"}
     
     
-    def _llm_evaluate_config(self, analysis: Dict, selector_results: Dict, jobs: List[Dict], pagination_test: Dict, html_structure: str, url: str) -> Dict:
+    def _llm_evaluate_config(self, analysis: Dict, jobs: List[Dict], html_structure: str, url: str) -> Dict:
         """Let LLM evaluate the config based on all test results."""
         self.logger.info("LLM evaluating config results...")
         
@@ -914,7 +888,7 @@ Evaluation guidelines:
   * URL selector extracts valid job links
 
 - OPTIONAL ELEMENTS (empty/missing is acceptable):
-  * Description selector - job pages may not have descriptions on listing pages
+  * Description selector - job pages may not have descriptions on listing pages/
   * Location selector - some sites don't show location in listings
   * Requirements selector - often not available on listing pages
   * Pagination selector - only needed if site has multiple pages
@@ -924,6 +898,7 @@ Evaluation guidelines:
   * Don't penalize empty optional selectors - they may be intentionally empty
   * Focus on whether the scraper successfully extracts job data (title, URL)
   * Consider the context: listing pages vs detail pages have different available data
+  * IMPORTANT: Job URLs pointing to different domains (like greenhouse.io, workday.com, etc.) is NORMAL and EXPECTED - many companies use external job board systems
 
 Recommend retry if CRITICAL selectors are broken OR if no jobs are being extracted"""
 
@@ -934,14 +909,8 @@ URL: {url}
 ORIGINAL AI ANALYSIS:
 {json.dumps(analysis, indent=2)}
 
-SELECTOR TEST RESULTS:
-{json.dumps(selector_results, indent=2)}
-
 JOBS EXTRACTED ({len(jobs)} total):
 {json.dumps(job_sample, indent=2)}
-
-PAGINATION TEST (if applicable):
-{json.dumps(pagination_test, indent=2)}
 
 HTML STRUCTURE (for reference):
 {html_structure[:500000]}
@@ -970,6 +939,8 @@ Evaluate the configuration quality and recommend if retry is needed."""
             'search_required': analysis.get('search_required', False),
             'search_input_selector': analysis.get('search_input_selector', ''),
             'search_submit_selector': analysis.get('search_submit_selector', ''),
+            'search_query': analysis.get('search_query', 'intern'),
+            'text_filter_keywords': analysis.get('text_filter_keywords', ''),
         }
     
     def generate_scraper_config(self, company_name: str, url: str, analysis: Dict) -> Dict:
