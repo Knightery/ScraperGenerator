@@ -11,7 +11,7 @@ import os
 import sys
 
 from main_scraper import CompanyJobScraper
-from database import DatabaseManager
+from supabase_database import SupabaseDatabaseManager
 from search_engine import SearchEngine
 from ai_navigator import AINavigator
 from playwright_scraper import PlaywrightScraperSync
@@ -195,7 +195,7 @@ def list_companies_command(args):
     """List all companies in the database."""
     print("\n=== Registered Companies ===")
     
-    db = DatabaseManager()
+    db = SupabaseDatabaseManager()
     companies = db.get_all_active_companies()
     
     if companies:

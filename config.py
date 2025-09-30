@@ -10,7 +10,12 @@ class Config:
     GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
     BRAVE_API_KEY = os.getenv('BRAVE_API_KEY')
     
-    # Database Configuration
+    # Supabase Database Configuration (PostgreSQL)
+    SUPABASE_URL = os.getenv('SUPABASE_URL')
+    SUPABASE_ANON_KEY = os.getenv('SUPABASE_ANON_KEY')
+    SUPABASE_SERVICE_KEY = os.getenv('SUPABASE_SERVICE_KEY')
+    
+    # Legacy SQLite path (for migration purposes only)
     DATABASE_PATH = os.getenv('DATABASE_PATH', './jobs.db')
     
     # Logging Configuration

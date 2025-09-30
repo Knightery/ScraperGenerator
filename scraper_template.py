@@ -13,7 +13,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from playwright_scraper import PlaywrightScraperSync
-from database import DatabaseManager
+from supabase_database import SupabaseDatabaseManager
 
 
 def setup_logging():
@@ -63,7 +63,7 @@ def main():
     
     # Initialize database-enabled scraper
     scraper = PlaywrightScraperSync(use_database=True)
-    db_manager = DatabaseManager()
+    db_manager = SupabaseDatabaseManager()
     
     # Get company info from database
     company = db_manager.get_company_by_name('{company_name}')
@@ -71,9 +71,6 @@ def main():
         logger.error("Company '{{company_name}}' not found in database")
         print("Error: Company not found in database. Please add the company first.")
         return
-    
-    # Update last scraped timestamp
-    db_manager.update_company_scraper(company['id'], "")
     
     # Scrape jobs and get filtered HTML
     jobs, filtered_html = scraper.scrape_jobs(config['scrape_url'], config)
@@ -95,13 +92,6 @@ def main():
             print(f"   Location: {{job.get('location', 'Not specified')}}")
             print(f"   URL: {{job.get('url', 'No URL')}}")
             print()
-        
-        # Save backup file
-        import json
-        backup_file = '{backup_filename}'
-        with open(backup_file, 'w', encoding='utf-8') as f:
-            json.dump(jobs, f, indent=2, ensure_ascii=False)
-        print(f"Backup saved: {{backup_file}}")
         
     else:
         logger.warning("No jobs found - scraper may need adjustment")

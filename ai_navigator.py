@@ -553,7 +553,7 @@ Return 1-2 sentences explaining the issue:"""
         visible_text = content_data['visible_text'][:8000]
         html_structure = content_data['cleaned_html'][:100000]
         
-        prompt = f"""TASK: Determine if search or button interaction is needed to filter for internships only.
+        prompt = f"""TASK: Determine if search or button interaction is needed to filter for internships/coops/placements/etc. on this job page.
 
 REQUIRED: If TRUE, provide EXACT CSS selectors from HTML below. Support two interaction types:
 1. SEARCH BAR: Provide search_query + search_input_selector + optional search_submit_selector
@@ -572,10 +572,10 @@ Return JSON:
   "reasoning": "one sentence explaining the interaction type"
 }}
 
-Context: Search/filter interaction for internship-only scraping. Two modes supported:
+Context: Search/filter interaction for student career opportunity (e.g. co-ops, internships, placement programs) scraping. We want to scrape all types of student opportunities, so only search if necessary to filter out actual jobs. Two modes supported:
 - SEARCH MODE: Use search bar with query + input selector + optional submit selector
 - BUTTON MODE: Click filter/category button directly (search_query and search_input_selector will be empty)
-Look for dedicated internship filter buttons, category links, or search functionality."""
+Look for dedicated filter buttons, category links, or search functionality."""
 
         result = json.loads(self._llm_query(prompt, json_response=True))
         self.logger.info(f"LLM search analysis: {result}")

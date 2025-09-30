@@ -14,9 +14,8 @@ parent_dir = current_dir.parent
 sys.path.append(str(parent_dir))
 
 from flask import Flask, render_template, request, jsonify
-import sqlite3
 from datetime import datetime, timedelta
-from database import DatabaseManager
+from supabase_database import SupabaseDatabaseManager
 import logging
 
 # Initialize Flask app
@@ -30,150 +29,27 @@ app.secret_key = os.environ.get('SECRET_KEY', 'vercel-job-scraper-secret-key')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database configuration for serverless
-DB_PATH = os.environ.get('DATABASE_URL', str(parent_dir / 'jobs.db'))
-
-class VercelDatabaseManager:
-    """Database manager adapted for Vercel serverless environment."""
-    
-    def __init__(self):
-        self.db_path = DB_PATH
-        self._ensure_database()
-    
-    def _ensure_database(self):
-        """Ensure database exists and is initialized."""
-        try:
-            if not os.path.exists(self.db_path):
-                logger.warning(f"Database not found at {self.db_path}. Creating empty database.")
-                # Create minimal database structure
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.execute('''
-                        CREATE TABLE IF NOT EXISTS companies (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            name TEXT UNIQUE NOT NULL,
-                            url TEXT NOT NULL,
-                            status TEXT DEFAULT 'active',
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    ''')
-                    conn.execute('''
-                        CREATE TABLE IF NOT EXISTS jobs (
-                            id INTEGER PRIMARY KEY AUTOINCREMENT,
-                            company_id INTEGER NOT NULL,
-                            title TEXT NOT NULL,
-                            url TEXT NOT NULL,
-                            location TEXT,
-                            description TEXT,
-                            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            FOREIGN KEY (company_id) REFERENCES companies (id),
-                            UNIQUE(company_id, title, url)
-                        )
-                    ''')
-                    conn.commit()
-        except Exception as e:
-            logger.error(f"Database initialization error: {e}")
-    
-    def get_connection(self):
-        """Get database connection."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-    
-    def get_company_by_name(self, name):
-        """Get company by name."""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT * FROM companies WHERE name = ?', (name,))
-                row = cursor.fetchone()
-                return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Error getting company by name: {e}")
-            return None
-    
-    def get_jobs_by_company(self, company_id, limit=100):
-        """Get jobs for a specific company."""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    SELECT * FROM jobs 
-                    WHERE company_id = ? 
-                    ORDER BY scraped_at DESC 
-                    LIMIT ?
-                ''', (company_id, limit))
-                return [dict(row) for row in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error getting jobs by company: {e}")
-            return []
-    
-    def get_scraper_stats(self, company_id):
-        """Get scraper statistics for a company."""
-        try:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute('SELECT COUNT(*) as total FROM jobs WHERE company_id = ?', (company_id,))
-                total_jobs = cursor.fetchone()['total']
-                
-                cursor.execute('''
-                    SELECT COUNT(*) as recent FROM jobs 
-                    WHERE company_id = ? AND scraped_at > datetime('now', '-7 days')
-                ''', (company_id,))
-                recent_jobs = cursor.fetchone()['recent']
-                
-                return {
-                    'total_jobs': total_jobs,
-                    'recent_jobs': recent_jobs
-                }
-        except Exception as e:
-            logger.error(f"Error getting scraper stats: {e}")
-            return {'total_jobs': 0, 'recent_jobs': 0}
-
-# Initialize database manager
-db = VercelDatabaseManager()
+# Initialize Supabase database manager
+logger.info("Initializing Supabase database")
+try:
+    db = SupabaseDatabaseManager()
+    logger.info("Supabase database manager initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Supabase database manager: {e}")
+    # For production deployment, we require Supabase to be configured
+    if os.environ.get('VERCEL_ENV'):
+        raise Exception("Supabase configuration required for production deployment")
+    else:
+        logger.error("Supabase not configured. Please check your environment variables.")
+        raise
 
 @app.route('/')
 def index():
     """Home page showing recent jobs and statistics."""
     try:
-        # Get recent jobs (last 50)
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT j.*, c.name as company_name
-                FROM jobs j
-                JOIN companies c ON j.company_id = c.id
-                WHERE c.status = 'active'
-                ORDER BY j.scraped_at DESC
-                LIMIT 50
-            ''')
-            recent_jobs = [dict(row) for row in cursor.fetchall()]
-            
-            # Get statistics
-            cursor.execute('SELECT COUNT(*) as total FROM jobs')
-            total_jobs = cursor.fetchone()['total']
-            
-            cursor.execute('SELECT COUNT(*) as total FROM companies WHERE status = "active"')
-            total_companies = cursor.fetchone()['total']
-            
-            cursor.execute('''
-                SELECT COUNT(*) as recent FROM jobs 
-                WHERE scraped_at > datetime('now', '-7 days')
-            ''')
-            jobs_this_week = cursor.fetchone()['recent']
-            
-            cursor.execute('''
-                SELECT COUNT(*) as recent FROM jobs 
-                WHERE scraped_at > datetime('now', '-1 day')
-            ''')
-            jobs_today = cursor.fetchone()['recent']
-        
-        stats = {
-            'total_jobs': total_jobs,
-            'total_companies': total_companies,
-            'jobs_this_week': jobs_this_week,
-            'jobs_today': jobs_today
-        }
+        # Get recent jobs and statistics from Supabase
+        recent_jobs = db.get_recent_jobs(limit=50)
+        stats = db.get_dashboard_stats()
         
         return render_template('index.html', jobs=recent_jobs, stats=stats)
         
@@ -282,20 +158,8 @@ def jobs():
 def companies():
     """Companies page showing all tracked companies."""
     try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT 
-                    c.*,
-                    COUNT(j.id) as job_count,
-                    MAX(j.scraped_at) as last_job_scraped
-                FROM companies c
-                LEFT JOIN jobs j ON c.id = j.company_id
-                WHERE c.status = 'active'
-                GROUP BY c.id
-                ORDER BY c.name
-            ''')
-            companies_list = [dict(row) for row in cursor.fetchall()]
+        # Get companies with statistics from Supabase
+        companies_list = db.get_companies_with_stats()
         
         return render_template('companies.html', companies=companies_list)
         
@@ -444,11 +308,18 @@ def internal_error(error):
 @app.route('/api/health')
 def health_check():
     """Health check endpoint."""
-    return jsonify({
-        'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
-        'database': 'connected' if os.path.exists(DB_PATH) else 'not_found'
-    })
+    try:
+        # Use Supabase health check
+        health_status = db.health_check()
+        health_status['database_type'] = 'supabase'
+        return jsonify(health_status)
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat(),
+            'database_type': 'supabase'
+        }), 500
 
 # Vercel entry point - the app instance is automatically detected
 
