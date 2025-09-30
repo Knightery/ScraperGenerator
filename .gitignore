@@ -1,6 +1,7 @@
 # Archive folder
 Archive/
 debug_html/
+node_modules/
 
 # Environment files
 .env

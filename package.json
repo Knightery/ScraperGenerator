@@ -1,0 +1,14 @@
+{
+  "scripts": {
+    "dev": "python api/main.py",
+    "start": "python api/main.py",
+    "build": "echo 'Build completed for Python Flask app'",
+    "test": "python -m pytest tests/ -v",
+    "install-deps": "pip install -r requirements.txt",
+    "vercel-dev": "vercel dev",
+    "deploy": "vercel --prod"
+  },
+  "devDependencies": {
+    "vercel": "^32.0.0"
+  }
+}
