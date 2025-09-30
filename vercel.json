@@ -1,19 +1,5 @@
 {
   "version": 2,
-  "routes": [
-    {
-      "src": "/static/(.*)",
-      "dest": "/static/$1"
-    },
-    {
-      "src": "/favicon.ico",
-      "dest": "/static/favicon.ico"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/api/index.py"
-    }
-  ],
   "env": {
     "FLASK_APP": "api/index.py"
   },
@@ -23,6 +9,14 @@
     }
   },
   "rewrites": [
+    {
+      "source": "/static/(.*)",
+      "destination": "/static/$1"
+    },
+    {
+      "source": "/favicon.ico", 
+      "destination": "/static/favicon.ico"
+    },
     {
       "source": "/(.*)",
       "destination": "/api/index.py"
