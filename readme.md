@@ -9,6 +9,22 @@ Bring your own **Gemini API key** when starting a run – the UI will prompt for
 * A structured log timeline with timestamps and status chips
 * Final output details, including the generated scraper path and resolved job board URL
 
+### Render offload
+The heavy scraper generation now runs on a Render worker so Vercel stays within the 250 MB package budget. Set the following environment variables on Vercel:
+
+| Variable | Purpose |
+| --- | --- |
+| `RENDER_SCRAPER_URL` | HTTPS endpoint exposed by the Render service that starts a scraper build |
+| `RENDER_API_KEY` | Optional bearer token that the Render service expects in the `Authorization` header |
+
+The Vercel endpoint posts `{company, geminiApiKey, jobId, callbackUrl}` to the Render service. Progress updates are streamed back through the `callbackUrl` so the UI can continue to show live logs and previews.
+
+**Render start command**
+
+```
+uvicorn render_worker:app --host 0.0.0.0 --port 10000
+```
+
 ## Pipeline overview
 
 ### Search

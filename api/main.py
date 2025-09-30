@@ -11,19 +11,19 @@ import threading
 import uuid
 from pathlib import Path
 from queue import Empty, Queue
+from urllib.parse import unquote, urljoin
+
+import requests
+from flask import Flask, render_template, request, jsonify, Response
+from datetime import datetime
+from supabase_database import SupabaseDatabaseManager
+import logging
+from typing import Dict, Optional
 
 # Add the parent directory to the path to import our modules
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
 sys.path.append(str(parent_dir))
-
-from flask import Flask, render_template, request, jsonify, Response
-from datetime import datetime
-from supabase_database import SupabaseDatabaseManager
-from main_scraper import CompanyJobScraper
-import logging
-from urllib.parse import unquote
-from typing import Dict, Optional
 
 # Initialize Flask app
 app = Flask(__name__, 
@@ -200,44 +200,100 @@ def api_create_scraper():
         event_payload['timestamp'] = datetime.utcnow().isoformat()
         queue.put(event_payload)
 
-    def run_workflow():
-        try:
-            scraper = CompanyJobScraper(gemini_api_key=gemini_key, progress_callback=progress)
-            success = scraper.add_company(company, gemini_api_key=gemini_key, progress_callback=progress)
-            final_status = 'success' if success else 'error'
-            queue.put({
-                'type': 'finalized',
-                'stage': 'finalized',
-                'status': final_status,
-                'company': company,
-                'message': 'Workflow finished' if success else 'Workflow ended with errors',
-                'timestamp': datetime.utcnow().isoformat()
-            })
-        except Exception as exc:
-            logger.exception("Create scraper workflow failed: %s", exc)
-            queue.put({
-                'type': 'error',
-                'stage': 'error',
-                'status': 'error',
-                'company': company,
-                'message': str(exc),
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            queue.put({
-                'type': 'finalized',
-                'stage': 'finalized',
-                'status': 'error',
-                'company': company,
-                'message': 'Workflow terminated unexpectedly',
-                'timestamp': datetime.utcnow().isoformat()
-            })
-        finally:
-            queue.put(None)
+    render_url = os.getenv('RENDER_SCRAPER_URL')
+    render_token = os.getenv('RENDER_API_KEY')
 
-    worker = threading.Thread(target=run_workflow, name=f"create-scraper-{job_id}", daemon=True)
-    worker.start()
+    if not render_url:
+        error_message = 'Render scraper endpoint is not configured'
+        logger.error(error_message)
+        queue.put({
+            'type': 'error',
+            'stage': 'error',
+            'status': 'error',
+            'company': company,
+            'message': error_message,
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put({
+            'type': 'finalized',
+            'stage': 'finalized',
+            'status': 'error',
+            'company': company,
+            'message': 'Workflow terminated unexpectedly',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put(None)
+        return jsonify({'success': False, 'error': error_message}), 500
 
-    return jsonify({'success': True, 'jobId': job_id})
+    callback_path = f"/api/create-scraper/callback/{job_id}"
+    callback_url = urljoin(request.url_root, callback_path.lstrip('/'))
+
+    headers = {'Content-Type': 'application/json'}
+    if render_token:
+        headers['Authorization'] = f"Bearer {render_token}"
+
+    render_payload = {
+        'company': company,
+        'geminiApiKey': gemini_key,
+        'jobId': job_id,
+        'callbackUrl': callback_url
+    }
+
+    try:
+        response = requests.post(render_url, json=render_payload, headers=headers, timeout=15)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.exception("Failed to start Render scraper job: %s", exc)
+        queue.put({
+            'type': 'error',
+            'stage': 'error',
+            'status': 'error',
+            'company': company,
+            'message': f'Render request failed: {exc}',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put({
+            'type': 'finalized',
+            'stage': 'finalized',
+            'status': 'error',
+            'company': company,
+            'message': 'Workflow terminated unexpectedly',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put(None)
+        return jsonify({'success': False, 'error': 'Failed to start Render job'}), 502
+
+    render_response = response.json() if response.content else {}
+    queue.put({
+        'type': 'update',
+        'stage': 'render-dispatch',
+        'message': 'Render job accepted',
+        'company': company,
+        'renderJobId': render_response.get('jobId'),
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+    return jsonify({'success': True, 'jobId': job_id, 'render': render_response})
+
+
+@app.route('/api/create-scraper/callback/<job_id>', methods=['POST'])
+def api_create_scraper_callback(job_id: str):
+    """Receive progress events from the Render scraper worker."""
+    queue = _get_progress_channel(job_id)
+    if queue is None:
+        logger.warning("Received callback for unknown job %s", job_id)
+        return jsonify({'success': False, 'error': 'Job not found'}), 404
+
+    event = request.get_json(silent=True) or {}
+    event.setdefault('timestamp', datetime.utcnow().isoformat())
+    event.setdefault('jobId', job_id)
+
+    queue.put(event)
+
+    if event.get('type') == 'finalized' or event.get('final') or event.get('status') in {'success', 'error'}:
+        queue.put(None)
+
+    return jsonify({'success': True})
 
 
 @app.route('/api/create-scraper/events/<job_id>')
