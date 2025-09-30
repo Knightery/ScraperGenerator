@@ -22,10 +22,6 @@ __pycache__/
 *$py.class
 *.so
 
-# Generated scraper files
-*_scraper.py
-*_jobs_*.json
-
 # IDE files
 .vscode/
 .idea/

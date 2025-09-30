@@ -18,7 +18,7 @@ parent_dir = current_dir.parent
 sys.path.append(str(parent_dir))
 
 from flask import Flask, render_template, request, jsonify, Response
-from datetime import datetime, timedelta
+from datetime import datetime
 from supabase_database import SupabaseDatabaseManager
 from main_scraper import CompanyJobScraper
 import logging
