@@ -5,6 +5,7 @@ Provides a unified interface for database operations using Supabase PostgreSQL.
 
 import os
 import logging
+from collections import Counter
 from datetime import datetime
 from typing import List, Dict, Optional
 from supabase import create_client, Client
@@ -27,6 +28,19 @@ class SupabaseDatabaseManager:
         self.supabase: Client = create_client(self.supabase_url, self.supabase_key)
         self.logger.info("Supabase client initialized successfully")
     
+    @staticmethod
+    def _extract_count(response) -> int:
+        """Best-effort extraction of row counts from Supabase responses."""
+        count = getattr(response, 'count', None)
+        if count is not None:
+            return count
+
+        data = getattr(response, 'data', None)
+        if isinstance(data, list):
+            return len(data)
+
+        return 0
+
     def create_tables_if_not_exist(self):
         """Create tables by testing operations and handling gracefully."""
         self.logger.info("Ensuring database tables exist...")
@@ -407,65 +421,156 @@ class SupabaseDatabaseManager:
             stats = {}
             
             # Total jobs
-            result = self.supabase.table('jobs').select('id', count='exact').execute()
-            stats['total_jobs'] = result.count or 0
+            result = self.supabase.table('jobs')\
+                .select('id', count='exact', head=True)\
+                .execute()
+            stats['total_jobs'] = self._extract_count(result)
             
             # Total companies
             result = self.supabase.table('companies')\
-                .select('id', count='exact')\
+                .select('id', count='exact', head=True)\
                 .eq('status', 'active')\
                 .execute()
-            stats['total_companies'] = result.count or 0
+            stats['total_companies'] = self._extract_count(result)
             
             # Jobs this week
             result = self.supabase.table('jobs')\
-                .select('id', count='exact')\
+                .select('id', count='exact', head=True)\
                 .gte('scraped_at', 'now() - interval \'7 days\'')\
                 .execute()
-            stats['jobs_this_week'] = result.count or 0
+            stats['jobs_this_week'] = self._extract_count(result)
             
             # Jobs today
             result = self.supabase.table('jobs')\
-                .select('id', count='exact')\
+                .select('id', count='exact', head=True)\
                 .gte('scraped_at', 'now() - interval \'1 day\'')\
                 .execute()
-            stats['jobs_today'] = result.count or 0
+            stats['jobs_today'] = self._extract_count(result)
             
             return stats
             
         except Exception as e:
             self.logger.error(f"Error getting dashboard stats: {e}")
             return {'total_jobs': 0, 'total_companies': 0, 'jobs_this_week': 0, 'jobs_today': 0}
+
+    def get_top_locations(self, limit: int = 20, sample_size: int = 1000) -> List[str]:
+        """Return the most common job locations from recent records."""
+        try:
+            result = self.supabase.table('jobs')\
+                .select('location')\
+                .order('scraped_at', desc=True)\
+                .limit(sample_size)\
+                .execute()
+
+            if not result.data:
+                return []
+
+            locations = [row['location'].strip() for row in result.data if row.get('location')]
+            counts = Counter(locations)
+            return [location for location, _ in counts.most_common(limit)]
+
+        except Exception as e:
+            self.logger.error(f"Error getting top locations: {e}")
+            return []
+
+    def get_top_companies(self, limit: int = 10) -> List[Dict]:
+        """Return the top companies by job count."""
+        try:
+            companies = self.get_companies_with_stats()
+            sorted_companies = sorted(
+                companies,
+                key=lambda company: company.get('job_count', 0),
+                reverse=True
+            )
+            return [
+                {
+                    'name': company['name'],
+                    'job_count': company.get('job_count', 0)
+                }
+                for company in sorted_companies[:limit]
+            ]
+
+        except Exception as e:
+            self.logger.error(f"Error getting top companies: {e}")
+            return []
     
+    def get_scraper_activity_summary(self, hours: int = 24) -> Dict:
+        """Aggregate scraper log activity over the requested time window."""
+        try:
+            threshold = f"now() - interval '{hours} hours'"
+            response = self.supabase.table('scraper_logs')\
+                .select('success,jobs_found,execution_time')\
+                .gte('execution_time', threshold)\
+                .execute()
+
+            logs = response.data or []
+
+            if not logs:
+                return {
+                    'total_runs': 0,
+                    'successful_runs': 0,
+                    'failed_runs': 0,
+                    'total_jobs': 0,
+                    'last_run': None
+                }
+
+            total_runs = len(logs)
+            successful_runs = sum(1 for log in logs if log.get('success'))
+            total_jobs = sum(log.get('jobs_found', 0) or 0 for log in logs)
+            last_run = max(log.get('execution_time') for log in logs if log.get('execution_time'))
+
+            return {
+                'total_runs': total_runs,
+                'successful_runs': successful_runs,
+                'failed_runs': total_runs - successful_runs,
+                'total_jobs': total_jobs,
+                'last_run': last_run
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error summarizing scraper activity: {e}")
+            return {
+                'total_runs': 0,
+                'successful_runs': 0,
+                'failed_runs': 0,
+                'total_jobs': 0,
+                'last_run': None
+            }
+
     def search_jobs(self, search_query: str = None, company_filter: str = None, 
                    location_filter: str = None, limit: int = 50, offset: int = 0) -> Dict:
         """Search jobs with filters."""
         try:
-            query = self.supabase.table('jobs').select('*, companies(name)')
+            data_query = self.supabase.table('jobs').select('*, companies(name)')
+            count_query = self.supabase.table('jobs').select('id', count='exact', head=True)
+            builders = (data_query, count_query)
             
             # Apply filters
             if company_filter:
                 # First get company ID
                 company = self.get_company_by_name(company_filter)
                 if company:
-                    query = query.eq('company_id', company['id'])
+                    for builder in builders:
+                        builder.eq('company_id', company['id'])
                 else:
                     return {'jobs': [], 'total_count': 0}
             
             if search_query:
                 # Note: Supabase doesn't have native full-text search on all plans
                 # Using ilike for basic text search
-                query = query.or_(f'title.ilike.%{search_query}%,description.ilike.%{search_query}%')
+                for builder in builders:
+                    builder.or_(f'title.ilike.%{search_query}%,description.ilike.%{search_query}%')
             
             if location_filter:
-                query = query.ilike('location', f'%{location_filter}%')
+                for builder in builders:
+                    builder.ilike('location', f'%{location_filter}%')
             
             # Get total count for pagination
-            count_result = query.select('id', count='exact').execute()
-            total_count = count_result.count or 0
+            count_result = count_query.execute()
+            total_count = self._extract_count(count_result)
             
             # Get paginated results
-            result = query.order('scraped_at', desc=True).range(offset, offset + limit - 1).execute()
+            result = data_query.order('scraped_at', desc=True).range(offset, offset + limit - 1).execute()
             
             jobs = result.data or []
             

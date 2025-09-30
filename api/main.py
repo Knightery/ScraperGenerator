@@ -17,6 +17,7 @@ from flask import Flask, render_template, request, jsonify
 from datetime import datetime, timedelta
 from supabase_database import SupabaseDatabaseManager
 import logging
+from urllib.parse import unquote
 
 # Initialize Flask app
 app = Flask(__name__, 
@@ -69,60 +70,22 @@ def jobs():
         per_page = 20
         offset = (page - 1) * per_page
         
-        # Build SQL query
-        sql = '''
-            SELECT j.*, c.name as company_name
-            FROM jobs j
-            JOIN companies c ON j.company_id = c.id
-            WHERE c.status = 'active'
-        '''
-        params = []
-        
-        if company_filter:
-            sql += ' AND c.name = ?'
-            params.append(company_filter)
-            
-        if search_query:
-            sql += ' AND (j.title LIKE ? OR j.description LIKE ?)'
-            params.extend([f'%{search_query}%', f'%{search_query}%'])
-            
-        if location_filter:
-            sql += ' AND j.location LIKE ?'
-            params.append(f'%{location_filter}%')
-        
-        # Get total count for pagination
-        count_sql = sql.replace('SELECT j.*, c.name as company_name', 'SELECT COUNT(*)')
-        
-        sql += ' ORDER BY j.scraped_at DESC LIMIT ? OFFSET ?'
-        params.extend([per_page, offset])
-        
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Get jobs
-            cursor.execute(sql, params)
-            jobs_list = [dict(row) for row in cursor.fetchall()]
-            
-            # Get total count
-            cursor.execute(count_sql, params[:-2])  # Remove LIMIT and OFFSET params
-            total_jobs = cursor.fetchone()[0]
-            
-            # Get companies for filter dropdown
-            cursor.execute('SELECT name FROM companies WHERE status = "active" ORDER BY name')
-            companies = [row['name'] for row in cursor.fetchall()]
-            
-            # Get unique locations for filter dropdown (top 20)
-            cursor.execute('''
-                SELECT location, COUNT(*) as count
-                FROM jobs j
-                JOIN companies c ON j.company_id = c.id
-                WHERE c.status = 'active' AND j.location IS NOT NULL AND j.location != ''
-                GROUP BY location
-                ORDER BY count DESC
-                LIMIT 20
-            ''')
-            locations = [row['location'] for row in cursor.fetchall()]
-        
+        search_result = db.search_jobs(
+            search_query=search_query,
+            company_filter=company_filter,
+            location_filter=location_filter,
+            limit=per_page,
+            offset=offset
+        )
+
+        jobs_list = search_result.get('jobs', [])
+        total_jobs = search_result.get('total_count', 0)
+
+        companies_data = db.get_all_active_companies()
+        companies = sorted(company['name'] for company in companies_data)
+
+        locations = db.get_top_locations(limit=20)
+
         # Calculate pagination
         total_pages = (total_jobs + per_page - 1) // per_page
         has_prev = page > 1
@@ -171,6 +134,7 @@ def companies():
 def company_detail(company_name):
     """Detailed view of a specific company and its jobs."""
     try:
+        company_name = unquote(company_name)
         company = db.get_company_by_name(company_name)
         if not company:
             return render_template('error.html', error=f"Company '{company_name}' not found"), 404
@@ -199,34 +163,16 @@ def api_jobs_search():
         location_filter = request.args.get('location', '')
         limit = min(int(request.args.get('limit', 50)), 100)  # Max 100 results
         
-        sql = '''
-            SELECT j.*, c.name as company_name
-            FROM jobs j
-            JOIN companies c ON j.company_id = c.id
-            WHERE c.status = 'active'
-        '''
-        params = []
-        
-        if company_filter:
-            sql += ' AND c.name = ?'
-            params.append(company_filter)
-            
-        if search_query:
-            sql += ' AND (j.title LIKE ? OR j.description LIKE ?)'
-            params.extend([f'%{search_query}%', f'%{search_query}%'])
-            
-        if location_filter:
-            sql += ' AND j.location LIKE ?'
-            params.append(f'%{location_filter}%')
-        
-        sql += ' ORDER BY j.scraped_at DESC LIMIT ?'
-        params.append(limit)
-        
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(sql, params)
-            jobs_list = [dict(row) for row in cursor.fetchall()]
-        
+        search_result = db.search_jobs(
+            search_query=search_query,
+            company_filter=company_filter,
+            location_filter=location_filter,
+            limit=limit,
+            offset=0
+        )
+
+        jobs_list = search_result.get('jobs', [])
+
         return jsonify({
             'success': True,
             'jobs': jobs_list,
@@ -244,47 +190,16 @@ def api_jobs_search():
 def api_stats():
     """API endpoint for system statistics."""
     try:
-        with db.get_connection() as conn:
-            cursor = conn.cursor()
-            
-            # Overall statistics
-            cursor.execute('SELECT COUNT(*) as total FROM jobs')
-            total_jobs = cursor.fetchone()['total']
-            
-            cursor.execute('SELECT COUNT(*) as total FROM companies WHERE status = "active"')
-            total_companies = cursor.fetchone()['total']
-            
-            cursor.execute('''
-                SELECT COUNT(*) as recent FROM jobs 
-                WHERE scraped_at > datetime('now', '-7 days')
-            ''')
-            jobs_this_week = cursor.fetchone()['recent']
-            
-            cursor.execute('''
-                SELECT COUNT(*) as recent FROM jobs 
-                WHERE scraped_at > datetime('now', '-1 day')
-            ''')
-            jobs_today = cursor.fetchone()['recent']
-            
-            # Top companies by job count
-            cursor.execute('''
-                SELECT c.name, COUNT(j.id) as job_count
-                FROM companies c
-                LEFT JOIN jobs j ON c.id = j.company_id
-                WHERE c.status = 'active'
-                GROUP BY c.id, c.name
-                ORDER BY job_count DESC
-                LIMIT 10
-            ''')
-            top_companies = [dict(row) for row in cursor.fetchall()]
-        
+        stats = db.get_dashboard_stats()
+        top_companies = db.get_top_companies(limit=10)
+
         return jsonify({
             'success': True,
             'stats': {
-                'total_jobs': total_jobs,
-                'total_companies': total_companies,
-                'jobs_this_week': jobs_this_week,
-                'jobs_today': jobs_today,
+                'total_jobs': stats.get('total_jobs', 0),
+                'total_companies': stats.get('total_companies', 0),
+                'jobs_this_week': stats.get('jobs_this_week', 0),
+                'jobs_today': stats.get('jobs_today', 0),
                 'top_companies': top_companies
             }
         })
