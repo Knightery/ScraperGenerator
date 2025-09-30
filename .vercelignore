@@ -1,0 +1,81 @@
+# Vercel ignore file
+# Files and directories to exclude from deployment
+
+# Development files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache/
+.mypy_cache/
+.venv/
+venv/
+env/
+ENV/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Logs
+*.log
+logs/
+cli.log
+scraper.log
+
+# Database files (comment out if you want to include jobs.db)
+# jobs.db
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build files
+dist/
+build/
+*.egg-info/
+
+# Backup files
+*.bak
+*.backup
+
+# Archive files
+Archive/
+
+# Test files
+test_*.py
+*_test.py
+
+# Debug files
+debug_html/
+
+# Large dependencies not needed for web interface
+playwright_scraper.py
+ai_navigator.py
+search_engine.py
+scrape_cli.py
+main_scraper.py
+auto_scraper.py
+run_web.py
+scrapers/
+
+# Original requirements (use requirements-vercel.txt instead)
+requirements.txt

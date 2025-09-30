@@ -1,0 +1,6 @@
+# Core web dependencies for Vercel deployment
+flask>=2.3.0
+werkzeug>=2.3.0
+
+# Database and utilities
+python-dotenv>=1.0.0

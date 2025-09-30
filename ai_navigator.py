@@ -361,8 +361,8 @@ class AINavigator:
             self.logger.warning("HTML cleaning returned None, using original content")
             cleaned_html_str = page_content
         
-        # Export cleaned HTML for debugging
-        self._export_cleaned_html(cleaned_html_str, base_url)
+        # Export cleaned HTML for debugging - testing only
+        #self._export_cleaned_html(cleaned_html_str, base_url)
         
         # Extract visible text from cleaned content
         cleaned_soup = BeautifulSoup(cleaned_html_str, 'html.parser')

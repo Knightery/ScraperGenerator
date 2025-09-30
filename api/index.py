@@ -1,25 +1,136 @@
 #!/usr/bin/env python3
 """
-Flask web application for the Job Scraper system.
-Provides a web interface to view and search scraped jobs.
+Vercel serverless function entry point for the Job Scraper Web Interface.
+This module adapts the Flask application to work with Vercel's serverless platform.
 """
 
-from flask import Flask, render_template, request, jsonify, redirect, url_for
+import os
+import sys
+from pathlib import Path
+
+# Add the parent directory to the path to import our modules
+current_dir = Path(__file__).parent
+parent_dir = current_dir.parent
+sys.path.append(str(parent_dir))
+
+from flask import Flask, render_template, request, jsonify
 import sqlite3
 from datetime import datetime, timedelta
 from database import DatabaseManager
 import logging
-import os
 
-app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY', 'your-secret-key-change-this')
+# Initialize Flask app
+app = Flask(__name__, 
+           template_folder=str(parent_dir / 'templates'),
+           static_folder=str(parent_dir / 'static'))
 
-# Initialize database manager
-db = DatabaseManager()
+app.secret_key = os.environ.get('SECRET_KEY', 'vercel-job-scraper-secret-key')
 
-# Setup logging
+# Setup logging for Vercel
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Database configuration for serverless
+DB_PATH = os.environ.get('DATABASE_URL', str(parent_dir / 'jobs.db'))
+
+class VercelDatabaseManager:
+    """Database manager adapted for Vercel serverless environment."""
+    
+    def __init__(self):
+        self.db_path = DB_PATH
+        self._ensure_database()
+    
+    def _ensure_database(self):
+        """Ensure database exists and is initialized."""
+        try:
+            if not os.path.exists(self.db_path):
+                logger.warning(f"Database not found at {self.db_path}. Creating empty database.")
+                # Create minimal database structure
+                with sqlite3.connect(self.db_path) as conn:
+                    conn.execute('''
+                        CREATE TABLE IF NOT EXISTS companies (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT UNIQUE NOT NULL,
+                            url TEXT NOT NULL,
+                            status TEXT DEFAULT 'active',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    ''')
+                    conn.execute('''
+                        CREATE TABLE IF NOT EXISTS jobs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            company_id INTEGER NOT NULL,
+                            title TEXT NOT NULL,
+                            url TEXT NOT NULL,
+                            location TEXT,
+                            description TEXT,
+                            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (company_id) REFERENCES companies (id),
+                            UNIQUE(company_id, title, url)
+                        )
+                    ''')
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Database initialization error: {e}")
+    
+    def get_connection(self):
+        """Get database connection."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
+    def get_company_by_name(self, name):
+        """Get company by name."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT * FROM companies WHERE name = ?', (name,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error getting company by name: {e}")
+            return None
+    
+    def get_jobs_by_company(self, company_id, limit=100):
+        """Get jobs for a specific company."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT * FROM jobs 
+                    WHERE company_id = ? 
+                    ORDER BY scraped_at DESC 
+                    LIMIT ?
+                ''', (company_id, limit))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting jobs by company: {e}")
+            return []
+    
+    def get_scraper_stats(self, company_id):
+        """Get scraper statistics for a company."""
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) as total FROM jobs WHERE company_id = ?', (company_id,))
+                total_jobs = cursor.fetchone()['total']
+                
+                cursor.execute('''
+                    SELECT COUNT(*) as recent FROM jobs 
+                    WHERE company_id = ? AND scraped_at > datetime('now', '-7 days')
+                ''', (company_id,))
+                recent_jobs = cursor.fetchone()['recent']
+                
+                return {
+                    'total_jobs': total_jobs,
+                    'recent_jobs': recent_jobs
+                }
+        except Exception as e:
+            logger.error(f"Error getting scraper stats: {e}")
+            return {'total_jobs': 0, 'recent_jobs': 0}
+
+# Initialize database manager
+db = VercelDatabaseManager()
 
 @app.route('/')
 def index():
@@ -315,7 +426,7 @@ def api_stats():
         })
         
     except Exception as e:
-        logger.error(f"Error getting stats: {str(e)}")
+        logger.error(f"Error getting stats: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -329,16 +440,23 @@ def not_found(error):
 def internal_error(error):
     return render_template('error.html', error="Internal server error"), 500
 
+# Health check endpoint for Vercel
+@app.route('/api/health')
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.utcnow().isoformat(),
+        'database': 'connected' if os.path.exists(DB_PATH) else 'not_found'
+    })
+
+# Vercel requires this export for serverless functions
+# This is the main entry point for Vercel
+def handler(request, response=None):
+    """Vercel serverless function handler."""
+    return app(request.environ, lambda status, headers: None)
+
+# For local development
 if __name__ == '__main__':
-    # Create templates directory if it doesn't exist
-    os.makedirs('templates', exist_ok=True)
-    os.makedirs('static', exist_ok=True)
-    
-    # Run the app
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('DEBUG', 'False').lower() == 'true'
-    
-    print(f"Starting Job Scraper Web Interface on http://localhost:{port}")
-    print("Press Ctrl+C to stop the server")
-    
-    app.run(host='0.0.0.0', port=port, debug=debug)
+    app.run(host='0.0.0.0', port=port, debug=True)
