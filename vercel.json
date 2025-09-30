@@ -1,4 +1,14 @@
 {
-    "builds": [{ "src": "api/main.py", "use": "@vercel/python"}],
+    "builds": [{ "src": "api/main.py", "use": "@vercel/python" }],
+    "functions": {
+        "api/main.py": {
+            "includeFiles": [
+                "**/*.py",
+                "templates/**/*",
+                "static/**/*",
+                "scrapers/**/*"
+            ]
+        }
+    },
     "routes": [{ "src": "/(.*)", "dest": "api/main.py" }]
 }
