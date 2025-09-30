@@ -7,7 +7,7 @@ import os
 import logging
 from collections import Counter
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Iterable
 from supabase import create_client, Client
 from config import Config
 
@@ -494,6 +494,54 @@ class SupabaseDatabaseManager:
             self.logger.error(f"Error getting top companies: {e}")
             return []
     
+    def remove_stale_jobs(self, company_id: int, active_urls: Iterable[str]) -> Dict[str, int]:
+        """Remove jobs for a company that are no longer present in the latest scrape."""
+        try:
+            latest_urls = {url.strip() for url in active_urls if url}
+
+            existing_response = self.supabase.table('jobs')\
+                .select('id,url')\
+                .eq('company_id', company_id)\
+                .execute()
+
+            existing_jobs = existing_response.data or []
+            existing_urls = {job['url'] for job in existing_jobs if job.get('url')}
+
+            stale_urls = existing_urls - latest_urls
+
+            if not latest_urls and existing_urls:
+                self.logger.warning(
+                    f"Stale cleanup for company {company_id}: no active URLs detected; "
+                    f"marking all {len(existing_urls)} existing jobs as stale"
+                )
+
+            removed_count = 0
+            if stale_urls:
+                delete_query = self.supabase.table('jobs')\
+                    .delete()\
+                    .eq('company_id', company_id)\
+                    .in_('url', list(stale_urls))
+                delete_query.execute()
+                removed_count = len(stale_urls)
+
+            remaining = len(existing_urls) - removed_count
+            self.logger.info(
+                f"Stale cleanup for company {company_id}: removed {removed_count} jobs, {remaining} remain"
+            )
+
+            return {
+                'removed': removed_count,
+                'remaining': remaining
+            }
+
+        except Exception as e:
+            self.logger.error(f"Error removing stale jobs for company {company_id}: {e}")
+            return {
+                'removed': 0,
+                'remaining': 0,
+                'error': str(e)
+            }
+
     def get_scraper_activity_summary(self, hours: int = 24) -> Dict:
         """Aggregate scraper log activity over the requested time window."""
         try:

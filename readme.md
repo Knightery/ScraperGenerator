@@ -1,30 +1,35 @@
-How does it work:
+## Interactive scraper builder
 
-SEARCH:
+Visit `http://localhost:5000/create-scraper` (or `/create-scraper` on your deployment) to launch a guided workflow that mirrors `python scrape_cli.py add "Company"`.
 
-1. Uses Brave API in order to search for a relevant link
+Bring your own **Gemini API key** when starting a run – the UI will prompt for it and only uses the key for that single workflow. The live dashboard shows:
 
-SCRAPING:
-2. Uses playwright with viewport 1920 height 1080 and user_agent Firefox
-3. Uses beautifulsoup in order to cut out useless information such as header and footer.
-4. On the relevant link, sees if we should STAY or LEAVE to find job listings, feeds all links containing specific words on that page into LLM to choose whether or not to leave
-5. Goes to the job board, then takes the ENTIRE RELEVANT HTML and feeds it to the LLM in order to understand the structure of jobs.
-6. Parses this html to create a specific scraper script that will go to the job board URL, scrape every single job on the site using the specific indicators. The LLM should create the scraper script.
-7. Test the scraper, see if any jobs are retrieved. Use LLM to evaluate if jobs were retrieved or not.
-8. If so - Good, if not - Retry the script, feeding it the error logs. Do this up to two times. Make sure that everything is LLM friendly and industry standard.
-9. Save the final scraper in the current directory.
+* Real-time status pills that track search, analysis, validation, generation, and storage stages
+* A miniature browser window streaming Playwright screenshots from the AI navigator
+* A structured log timeline with timestamps and status chips
+* Final output details, including the generated scraper path and resolved job board URL
 
-DB:
-10. When the scraper runs, jobs go to jobs.db sorted by the url to ensure no repeats
-Todo: Merge entries where only field such as location is different, while the time is still the same.
-Todo:r Standardize things like location
+## Pipeline overview
 
-AUTOUPDATE (not implemented yet):
-11. Run the scraping script once every hour
+### Search
+1. Uses the Brave API to surface candidate job boards
+2. Gemini ranks the results to pick the best internship portal
 
-FRONTEND (not implemented yet):
-12. User can type in anything and then see what happens
+### Scraping
+3. Playwright launches a Firefox session with a 1920×1080 viewport
+4. HTML is cleaned with BeautifulSoup to remove chrome and extract link graph
+5. The AI navigator determines whether to stay, drill deeper, or return to search results
+6. Cleaned HTML and interactions are fed to Gemini to synthesize CSS selectors
+7. Playwright tests the selectors, scraping a sample of internship postings
+8. Gemini reviews the sample for correctness; on failure the loop retries up to two times
+9. A standalone scraper script is generated and saved locally
 
-TODO: Cinnamon Roll, fix searching by allowing interaction with the search bar
+### Database
+10. Jobs are persisted to Supabase with de-duplication by URL
+11. Legacy SQLite support (`jobs.db`) remains for local experimentation
 
-IMPROVEMENT NECESSARY: MAKE IT SO WE CAN SEE PAGINATION, IT IS AT BOTTOM SO SOMETIMES IS TRUNCATED - MOSTLY FIXED, one method could be feeding in the entire first html and letting the bot say which tags are irrelevant to then be able to see more at the bottom
+## Backlog
+* Merge job entries where only location differs while timestamps match
+* Standardize location and compensation fields
+* Autoupdate pipeline for hourly scraping runs
+* Enhanced search bar interactions for tricky sites

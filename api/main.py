@@ -4,20 +4,26 @@ Vercel serverless function entry point for the Job Scraper Web Interface.
 This module adapts the Flask application to work with Vercel's serverless platform.
 """
 
+import json
 import os
 import sys
+import threading
+import uuid
 from pathlib import Path
+from queue import Empty, Queue
 
 # Add the parent directory to the path to import our modules
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
 sys.path.append(str(parent_dir))
 
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response
 from datetime import datetime, timedelta
 from supabase_database import SupabaseDatabaseManager
+from main_scraper import CompanyJobScraper
 import logging
 from urllib.parse import unquote
+from typing import Dict, Optional
 
 # Initialize Flask app
 app = Flask(__name__, 
@@ -44,6 +50,28 @@ except Exception as e:
         logger.error("Supabase not configured. Please check your environment variables.")
         raise
 
+# In-memory progress channels for create-scraper workflows
+progress_channels: Dict[str, Queue] = {}
+progress_lock = threading.Lock()
+KEEPALIVE_SECONDS = 20
+
+
+def _register_progress_channel(job_id: str) -> Queue:
+    queue = Queue()
+    with progress_lock:
+        progress_channels[job_id] = queue
+    return queue
+
+
+def _get_progress_channel(job_id: str) -> Optional[Queue]:
+    with progress_lock:
+        return progress_channels.get(job_id)
+
+
+def _unregister_progress_channel(job_id: str) -> None:
+    with progress_lock:
+        progress_channels.pop(job_id, None)
+
 @app.route('/')
 def index():
     """Home page showing recent jobs and statistics."""
@@ -57,6 +85,12 @@ def index():
     except Exception as e:
         logger.error(f"Error loading home page: {str(e)}")
         return render_template('error.html', error=str(e)), 500
+
+
+@app.route('/create-scraper')
+def create_scraper_page():
+    """Interactive workflow for creating a new scraper."""
+    return render_template('create_scraper.html')
 
 @app.route('/jobs')
 def jobs():
@@ -129,6 +163,135 @@ def companies():
     except Exception as e:
         logger.error(f"Error loading companies page: {str(e)}")
         return render_template('error.html', error=str(e)), 500
+
+
+@app.route('/api/create-scraper', methods=['POST'])
+def api_create_scraper():
+    """Kick off a background scraper generation workflow."""
+    payload = request.get_json(silent=True) or {}
+    company = (payload.get('company') or '').strip()
+    gemini_key = (payload.get('geminiApiKey') or '').strip()
+
+    if not company:
+        return jsonify({'success': False, 'error': 'Company name is required'}), 400
+
+    if not gemini_key:
+        return jsonify({'success': False, 'error': 'Gemini API key is required for live search'}), 400
+
+    job_id = str(uuid.uuid4())
+    queue = _register_progress_channel(job_id)
+
+    queue.put({
+        'type': 'update',
+        'stage': 'queued',
+        'message': 'Queued and waiting for worker',
+        'company': company,
+        'timestamp': datetime.utcnow().isoformat()
+    })
+
+    def progress(event: Dict):
+        try:
+            event_payload = dict(event or {})
+        except Exception:
+            event_payload = {'type': 'error', 'message': 'Malformed progress payload'}
+
+        event_payload.setdefault('company', company)
+        event_payload.setdefault('type', event_payload.get('stage', 'update') or 'update')
+        event_payload['timestamp'] = datetime.utcnow().isoformat()
+        queue.put(event_payload)
+
+    def run_workflow():
+        try:
+            scraper = CompanyJobScraper(gemini_api_key=gemini_key, progress_callback=progress)
+            success = scraper.add_company(company, gemini_api_key=gemini_key, progress_callback=progress)
+            final_status = 'success' if success else 'error'
+            queue.put({
+                'type': 'finalized',
+                'stage': 'finalized',
+                'status': final_status,
+                'company': company,
+                'message': 'Workflow finished' if success else 'Workflow ended with errors',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        except Exception as exc:
+            logger.exception("Create scraper workflow failed: %s", exc)
+            queue.put({
+                'type': 'error',
+                'stage': 'error',
+                'status': 'error',
+                'company': company,
+                'message': str(exc),
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            queue.put({
+                'type': 'finalized',
+                'stage': 'finalized',
+                'status': 'error',
+                'company': company,
+                'message': 'Workflow terminated unexpectedly',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+        finally:
+            queue.put(None)
+
+    worker = threading.Thread(target=run_workflow, name=f"create-scraper-{job_id}", daemon=True)
+    worker.start()
+
+    return jsonify({'success': True, 'jobId': job_id})
+
+
+@app.route('/api/create-scraper/events/<job_id>')
+def api_create_scraper_events(job_id: str):
+    """Server-sent events stream for create-scraper progress."""
+
+    def event_stream():
+        queue = _get_progress_channel(job_id)
+        if queue is None:
+            yield f"event: error\ndata: {json.dumps({'status': 'error', 'message': 'Job not found'})}\n\n"
+            return
+
+        try:
+            while True:
+                try:
+                    item = queue.get(timeout=KEEPALIVE_SECONDS)
+                except Empty:
+                    keepalive = {
+                        'type': 'keepalive',
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'jobId': job_id
+                    }
+                    yield f"event: keepalive\ndata: {json.dumps(keepalive)}\n\n"
+                    continue
+
+                if item is None:
+                    yield f"event: closed\ndata: {json.dumps({'jobId': job_id})}\n\n"
+                    break
+
+                event_type = item.get('type') or 'update'
+                payload = dict(item)
+                payload['jobId'] = job_id
+
+                try:
+                    data = json.dumps(payload)
+                except TypeError:
+                    payload = {
+                        'type': 'error',
+                        'status': 'error',
+                        'message': 'Non-serializable payload encountered',
+                        'jobId': job_id,
+                        'timestamp': datetime.utcnow().isoformat()
+                    }
+                    data = json.dumps(payload)
+                    event_type = 'error'
+
+                yield f"event: {event_type}\ndata: {data}\n\n"
+        finally:
+            _unregister_progress_channel(job_id)
+
+    response = Response(event_stream(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
 
 @app.route('/company/<company_name>')
 def company_detail(company_name):

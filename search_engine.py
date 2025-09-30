@@ -9,10 +9,13 @@ from dotenv import load_dotenv
 class SearchEngine:
     """Handles company job board discovery using Brave Search API."""
     
-    def __init__(self):
-        self.api_key = Config.BRAVE_API_KEY
+    def __init__(self, brave_api_key: Optional[str] = None, gemini_api_key: Optional[str] = None):
+        load_dotenv()
+
+        self.api_key = brave_api_key or Config.BRAVE_API_KEY
         self.base_url = "https://api.search.brave.com/res/v1/web/search"
         self.logger = logging.getLogger(__name__)
+        self.gemini_api_key = gemini_api_key or os.getenv('GEMINI_API_KEY')
         
         if not self.api_key:
             raise ValueError("BRAVE_API_KEY not found in environment variables")
@@ -143,15 +146,11 @@ class SearchEngine:
     def _select_best_url_with_ai(self, results: List[Dict], company_name: str) -> Optional[str]:
         """Use Gemini AI to select the best URL for internship job listings."""
         try:
-            # Import here to avoid circular imports
-            
-            load_dotenv()
-            
-            gemini_api_key = os.getenv('GEMINI_API_KEY')
+            gemini_api_key = self.gemini_api_key or os.getenv('GEMINI_API_KEY')
             if not gemini_api_key:
                 self.logger.warning("GEMINI_API_KEY not found, falling back to first result")
                 return results[0].get('url') if results else None
-            
+
             # Configure Gemini client
             client = genai.Client(api_key=gemini_api_key)
             
@@ -227,9 +226,11 @@ Return ONLY the number (1-{len(results)}) of the best result. If none are suitab
     
     def _select_best_url_with_ai_and_feedback(self, results: List[Dict], company_name: str, rejected_urls: List[Dict]) -> Optional[str]:
         """Use Gemini AI to select the best URL for internship job listings, avoiding previously rejected URLs."""
-        load_dotenv()
-        
-        gemini_api_key = os.getenv('GEMINI_API_KEY')
+        gemini_api_key = self.gemini_api_key or os.getenv('GEMINI_API_KEY')
+        if not gemini_api_key:
+            self.logger.warning("GEMINI_API_KEY not found, returning None for alternative URL")
+            return None
+
         client = genai.Client(api_key=gemini_api_key)
         
         # Prepare search results for AI analysis

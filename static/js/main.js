@@ -1,5 +1,7 @@
 // Main JavaScript for Job Scraper Web Interface
 
+let scrollObserver;
+
 document.addEventListener('DOMContentLoaded', function() {
     // Initialize all components
     initializeClock();
@@ -245,33 +247,54 @@ function hideSearchLoading() {
 
 // Animation initialization
 function initializeAnimations() {
-    // Intersection Observer for scroll animations
-    const observer = new IntersectionObserver((entries) => {
-        entries.forEach(entry => {
-            if (entry.isIntersecting) {
-                entry.target.style.opacity = '1';
-                entry.target.style.transform = 'translateY(0)';
+    const elements = document.querySelectorAll('.card, .stat-card, .company-card, .job-card');
+    if (!elements.length) {
+        return;
+    }
+
+    elements.forEach(el => {
+        if (!el.classList.contains('animate-on-scroll')) {
+            el.classList.add('animate-on-scroll');
+        }
+    });
+
+    if (!('IntersectionObserver' in window)) {
+        elements.forEach(el => el.classList.add('is-visible'));
+    } else {
+        if (!scrollObserver) {
+            scrollObserver = new IntersectionObserver((entries, observer) => {
+                entries.forEach(entry => {
+                    if (entry.isIntersecting) {
+                        entry.target.classList.add('is-visible');
+                        observer.unobserve(entry.target);
+                    }
+                });
+            }, {
+                threshold: 0.15,
+                rootMargin: '0px 0px -40px 0px'
+            });
+        }
+
+        elements.forEach(el => {
+            if (!el.dataset.animationObserved) {
+                scrollObserver.observe(el);
+                el.dataset.animationObserved = 'true';
             }
         });
-    }, {
-        threshold: 0.1,
-        rootMargin: '0px 0px -50px 0px'
-    });
-    
-    // Observe all cards
-    document.querySelectorAll('.card').forEach(card => {
-        observer.observe(card);
-    });
-    
-    // Add hover effects to job cards
+    }
+
     document.querySelectorAll('.job-card').forEach(card => {
+        if (card.dataset.hoverBound) {
+            return;
+        }
         card.addEventListener('mouseenter', function() {
             this.style.transform = 'translateY(-2px)';
         });
         
         card.addEventListener('mouseleave', function() {
-            this.style.transform = 'translateY(0)';
+            this.style.transform = '';
         });
+        card.dataset.hoverBound = 'true';
     });
 }
 

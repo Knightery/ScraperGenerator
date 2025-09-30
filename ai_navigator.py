@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup
 from google import genai
@@ -36,9 +36,19 @@ class AINavigator:
     Uses PlaywrightScraper for validation and testing of generated scraper configurations.
     """
     
-    def __init__(self, search_engine=None, company_name=None):
+    def __init__(
+        self,
+        search_engine=None,
+        company_name=None,
+        gemini_api_key: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+    ):
         self.logger = logging.getLogger(__name__)
-        self.client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+        self._gemini_api_key = gemini_api_key or os.getenv('GEMINI_API_KEY')
+        if not self._gemini_api_key:
+            raise ValueError("GEMINI_API_KEY must be provided for AINavigator")
+
+        self.client = genai.Client(api_key=self._gemini_api_key)
         self._page_cache = {}  # Cache for cleaned page content
         self._content_cache = {}  # Cache for raw page content
         self._navigation_history = []  # Track navigation history for back functionality
@@ -51,6 +61,40 @@ class AINavigator:
         # Search engine context for going back to search results
         self._search_engine = search_engine
         self._company_name = company_name
+        self._progress_callback = progress_callback
+        self._last_preview_ts = 0
+
+    def _emit_progress(self, payload: Dict):
+        if not self._progress_callback:
+            return
+        try:
+            self._progress_callback(payload)
+        except Exception as exc:
+            self.logger.debug(f"Progress callback failed: {exc}")
+
+    def _emit_preview(self, stage: str, description: str):
+        if not self._progress_callback or not self._page:
+            return
+
+        try:
+            import base64
+            import time
+
+            now = time.time()
+            if now - self._last_preview_ts < 2:
+                return
+
+            screenshot_bytes = self._page.screenshot(full_page=False)
+            encoded = base64.b64encode(screenshot_bytes).decode('utf-8')
+            self._last_preview_ts = now
+            self._emit_progress({
+                'stage': stage,
+                'type': 'preview',
+                'message': description,
+                'image': f"data:image/png;base64,{encoded}",
+            })
+        except Exception as exc:
+            self.logger.debug(f"Failed to capture preview: {exc}")
     
     def __enter__(self):
         """Context manager entry."""
@@ -74,6 +118,7 @@ class AINavigator:
         """Start persistent browser session with single page instance."""
         if not self._browser:
             self.logger.info("Starting persistent browser session...")
+            self._emit_progress({'stage': 'browser', 'message': 'Launching analysis browser'})
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.firefox.launch(
                 headless=True,  # Set to True for production
@@ -111,6 +156,7 @@ class AINavigator:
             """)
             
             self.logger.info("Persistent browser session initialized")
+            self._emit_progress({'stage': 'browser', 'message': 'Browser ready for navigation'})
         else:
             self.logger.info("Reusing existing persistent browser session")
     
@@ -148,6 +194,7 @@ class AINavigator:
     def analyze_job_board(self, url: str) -> Dict:
         """Analyze a job board website and identify scraping targets with retry mechanism."""
         self.logger.info(f"Analyzing job board: {url}")
+        self._emit_progress({'stage': 'analysis', 'message': f'Starting job board analysis for {url}'})
         
         try:
             max_attempts = Config.AI_RETRY_ATTEMPTS
@@ -156,10 +203,12 @@ class AINavigator:
             self.logger.info("Initial navigation and page fetching...")
             internship_url = self._find_internship_page(url)
             if not internship_url:
+                self._emit_progress({'stage': 'analysis', 'message': 'Unable to locate internship page', 'status': 'warning'})
                 return {"error": "Could not find internship page"}
             
             page_content = self._get_page_content(internship_url)
             if not page_content:
+                self._emit_progress({'stage': 'analysis', 'message': 'Failed to load internship page content', 'status': 'error'})
                 return {"error": "Could not access internship page content"}
             
             # Get cleaned HTML for analysis
@@ -181,14 +230,17 @@ class AINavigator:
                     # URL actually changed after search, update our target URL
                     internship_url = search_analysis['new_url']
                     self.logger.info(f"URL changed after search interaction: {internship_url}")
+                    self._emit_progress({'stage': 'navigation', 'message': 'Search interaction updated page location', 'url': internship_url})
                 else:
                     # Search was performed but URL didn't change - content was updated in place
                     self.logger.info("Search performed successfully, content updated in place")
+                    self._emit_progress({'stage': 'navigation', 'message': 'Search interaction filtered listings'})
                 
                 # Use the fresh content from search result (regardless of URL change)
                 updated_content = search_analysis.get('updated_content')
                 if updated_content:
                     self.logger.info("Using fresh content from search results")
+                    self._emit_preview('navigation', 'Search results updated')
                     content_data = self._extract_clean_content_and_links(updated_content, internship_url)
                     html_structure = content_data['cleaned_html']
                 else:
@@ -212,6 +264,7 @@ class AINavigator:
                     analysis = self._analyze_with_ai_with_feedback(internship_url, html_structure, previous_feedback)
                     if "error" in analysis:
                         self.logger.warning(f"Attempt {attempt}: AI analysis failed: {analysis['error']}")
+                        self._emit_progress({'stage': 'analysis', 'message': analysis['error'], 'status': 'error'})
                         if attempt < max_attempts:
                             self._wait_before_retry(attempt)
                             continue
@@ -229,6 +282,8 @@ class AINavigator:
                     if validation_result["success"]:
                         self.logger.info(f"Analysis successful on attempt {attempt}")
                         analysis.update(validation_result)
+                        self._emit_progress({'stage': 'analysis', 'message': 'Selectors validated successfully', 'attempt': attempt})
+                        self._emit_progress({'stage': 'analysis', 'message': 'Analysis completed successfully', 'status': 'success'})
                         return analysis
                     else:
                         # Prepare feedback for next attempt
@@ -241,6 +296,7 @@ class AINavigator:
                         
                         error_msg = validation_result.get('error', f"LLM recommended retry. Issues: {validation_result.get('issues', [])}")
                         self.logger.warning(f"Attempt {attempt}: Config validation failed: {error_msg}")
+                        self._emit_progress({'stage': 'validation', 'message': error_msg, 'attempt': attempt, 'status': 'warning'})
                         
                         if attempt < max_attempts:
                             self._wait_before_retry(attempt)
@@ -249,6 +305,7 @@ class AINavigator:
                         
                 except Exception as e:
                     self.logger.error(f"Attempt {attempt}: Unexpected error during analysis: {str(e)}")
+                    self._emit_progress({'stage': 'analysis', 'message': str(e), 'status': 'error'})
                     if attempt < max_attempts:
                         self._wait_before_retry(attempt)
                         continue
@@ -645,7 +702,9 @@ Look for dedicated filter buttons, category links, or search functionality."""
             return self._content_cache[url]
             
         self._start_browser()
+        self._emit_progress({'stage': 'navigation', 'message': f'Loading {url}'})
         self._page.goto(url, wait_until='networkidle')
+        self._emit_preview('navigation', f'Loaded {url}')
         content = self._page.content()
         self._content_cache[url] = content
         return content
@@ -807,6 +866,7 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
         ensuring the same scraping logic is used for both validation and production.
         """
         self.logger.info("Starting PlaywrightScraper-based config validation...")
+        self._emit_progress({'stage': 'validation', 'message': 'Validating generated selectors with Playwright'})
         
         try:
             # Run PlaywrightScraper in a separate thread to avoid event loop conflicts
@@ -833,12 +893,7 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
                 }
                 
                 # DEBUG: Print the full test config including search fields
-                print(f"\n=== DEBUG: TEST CONFIG ===")
-                print(f"URL: {url}")
-                print(f"Config used for validation:")
-                for key, value in test_config.items():
-                    print(f"  {key}: {repr(value)}")
-                print(f"========================\n")
+                self._emit_progress({'stage': 'validation', 'message': 'Testing selectors on live page', 'url': url})
                 
                 # Extract sample jobs using PlaywrightScraper
                 jobs, _ = playwright_scraper.scrape_jobs(url, test_config)
@@ -852,18 +907,21 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
             
             self.logger.info(f"PlaywrightScraper validation completed successfully")
             self.logger.info(f"PlaywrightScraper extracted {len(jobs)} sample jobs for validation")
+            self._emit_progress({'stage': 'validation', 'message': f'Validation extracted {len(jobs)} sample jobs'})
             
             # Let LLM evaluate the results
             return self._llm_evaluate_config(analysis, jobs, html_structure, url)
             
         except Exception as e:
             self.logger.error(f"PlaywrightScraper validation failed: {str(e)}")
+            self._emit_progress({'stage': 'validation', 'message': str(e), 'status': 'error'})
             return {"success": False, "error": f"Validation failed: {str(e)}"}
     
     
     def _llm_evaluate_config(self, analysis: Dict, jobs: List[Dict], html_structure: str, url: str) -> Dict:
         """Let LLM evaluate the config based on all test results."""
         self.logger.info("LLM evaluating config results...")
+        self._emit_progress({'stage': 'analysis', 'message': 'Evaluating config quality with AI'})
         
         # Limit HTML to avoid token limits
         html_structure = html_structure[:200000]

@@ -15,6 +15,9 @@ from supabase_database import SupabaseDatabaseManager
 from search_engine import SearchEngine
 from ai_navigator import AINavigator
 from playwright_scraper import PlaywrightScraperSync
+from dotenv import load_dotenv
+
+load_dotenv()
 
 def setup_logging(verbose: bool = False):
     """Setup logging for the CLI."""
@@ -99,7 +102,8 @@ def test_workflow_command(args):
     
     # Step 2: AI navigation and analysis
     print("\n2. AI analyzing job board structure...")
-    ai_navigator = AINavigator(search_engine=search_engine, company_name=args.company)
+    gemini_api_key = os.getenv('GEMINI_API_KEY')
+    ai_navigator = AINavigator(search_engine=search_engine, company_name=args.company, gemini_api_key=gemini_api_key)
     analysis = ai_navigator.analyze_job_board(job_board_url)
     
     if "error" in analysis:
@@ -316,7 +320,6 @@ Examples:
             import traceback
             traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
