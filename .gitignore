@@ -1,5 +1,6 @@
 # Archive folder
 Archive/
+debug_html/
 
 # Environment files
 .env

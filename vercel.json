@@ -1,24 +1,14 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "functions": {
-    "api/index.py": {
-      "runtime": "python3.12",
-      "maxDuration": 30,
-      "includeFiles": "your_extra_files/**"
-    }
-  },
-  "rewrites": [
-    {
-      "source": "/static/(.*)",
-      "destination": "/static/$1"
-    },
-    {
-      "source": "/favicon.ico",
-      "destination": "/static/favicon.ico"
-    },
-    {
-      "source": "/(.*)",
-      "destination": "/api/index.py"
-    }
-  ]
+ "builds": [
+  {
+   "src": "api/main.py",
+   "use": "@vercel/python"
+  }
+ ],
+ "routes": [
+  {
+   "src": "/(.*)",
+   "dest": "api/main.py"
+  }
+ ]
 }
