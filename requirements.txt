@@ -10,3 +10,4 @@ supabase>=2.0.0
 psycopg2-binary>=2.9.0
 fastapi>=0.104.0
 uvicorn>=0.24.0
+playwright
