@@ -1,34 +1,37 @@
 #!/usr/bin/env python3
-"""
-Vercel serverless function entry point for the Job Scraper Web Interface.
-This module adapts the Flask application to work with Vercel's serverless platform.
-"""
+"""Vercel serverless function entry point for the Job Scraper Web Interface."""
 
 import json
+import logging
 import os
 import sys
 import threading
 import uuid
+from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
+from typing import Dict, Optional
 from urllib.parse import unquote, urljoin
 
 import requests
-from flask import Flask, render_template, request, jsonify, Response
-from datetime import datetime
-from supabase_database import SupabaseDatabaseManager
-import logging
-from typing import Dict, Optional
+from flask import Flask, Response, jsonify, render_template, request
+
 
 # Add the parent directory to the path to import our modules
 current_dir = Path(__file__).parent
 parent_dir = current_dir.parent
 sys.path.append(str(parent_dir))
 
+from supabase_database import SupabaseDatabaseManager
+
+
 # Initialize Flask app
-app = Flask(__name__, 
-           template_folder=str(parent_dir / 'templates'),
-           static_folder=str(parent_dir / 'static'))
+app = Flask(
+    __name__,
+    template_folder=str(parent_dir / 'templates'),
+    static_folder=str(parent_dir / 'static')
+)
+
 
 app.secret_key = os.environ.get('SECRET_KEY', 'vercel-job-scraper-secret-key')
 
@@ -203,28 +206,6 @@ def api_create_scraper():
     render_url = os.getenv('RENDER_SCRAPER_URL')
     render_token = os.getenv('RENDER_API_KEY')
 
-    if not render_url:
-        error_message = 'Render scraper endpoint is not configured'
-        logger.error(error_message)
-        queue.put({
-            'type': 'error',
-            'stage': 'error',
-            'status': 'error',
-            'company': company,
-            'message': error_message,
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        queue.put({
-            'type': 'finalized',
-            'stage': 'finalized',
-            'status': 'error',
-            'company': company,
-            'message': 'Workflow terminated unexpectedly',
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        queue.put(None)
-        return jsonify({'success': False, 'error': error_message}), 500
-
     callback_path = f"/api/create-scraper/callback/{job_id}"
     callback_url = urljoin(request.url_root, callback_path.lstrip('/'))
 
@@ -263,7 +244,34 @@ def api_create_scraper():
         queue.put(None)
         return jsonify({'success': False, 'error': 'Failed to start Render job'}), 502
 
-    render_response = response.json() if response.content else {}
+    try:
+        render_response = response.json() if response.content else {}
+    except ValueError:
+        preview = (response.text or '').strip()[:300]
+        logger.error("Render job returned non-JSON payload: %s", preview)
+        queue.put({
+            'type': 'error',
+            'stage': 'error',
+            'status': 'error',
+            'company': company,
+            'message': 'Render worker returned an unexpected response format. Please verify the RENDER_SCRAPER_URL.',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put({
+            'type': 'finalized',
+            'stage': 'finalized',
+            'status': 'error',
+            'company': company,
+            'message': 'Workflow terminated unexpectedly',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put(None)
+        _unregister_progress_channel(job_id)
+        return jsonify({
+            'success': False,
+            'error': 'Render worker response was not JSON. Confirm RENDER_SCRAPER_URL points to your worker /scraper endpoint.'
+        }), 502
+
     queue.put({
         'type': 'update',
         'stage': 'render-dispatch',
