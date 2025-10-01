@@ -192,18 +192,20 @@ def api_create_scraper():
         'timestamp': datetime.utcnow().isoformat()
     })
 
-    def progress(event: Dict):
-        try:
-            event_payload = dict(event or {})
-        except Exception:
-            event_payload = {'type': 'error', 'message': 'Malformed progress payload'}
-
-        event_payload.setdefault('company', company)
-        event_payload.setdefault('type', event_payload.get('stage', 'update') or 'update')
-        event_payload['timestamp'] = datetime.utcnow().isoformat()
-        queue.put(event_payload)
-
     render_url = os.getenv('RENDER_SCRAPER_URL')
+    if not render_url:
+        queue.put({
+            'type': 'error',
+            'stage': 'error',
+            'status': 'error',
+            'company': company,
+            'message': 'RENDER_SCRAPER_URL environment variable not configured',
+            'timestamp': datetime.utcnow().isoformat()
+        })
+        queue.put(None)
+        _unregister_progress_channel(job_id)
+        return jsonify({'success': False, 'error': 'Server not configured for scraper generation'}), 500
+    
     render_token = os.getenv('RENDER_API_KEY')
 
     callback_path = f"/api/create-scraper/callback/{job_id}"

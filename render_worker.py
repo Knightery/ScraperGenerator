@@ -29,22 +29,18 @@ class ScraperRequest(BaseModel):
     jobId: str
     callbackUrl: str
 
-
 class ScraperResponse(BaseModel):
     jobId: str
     status: str = "accepted"
 
-
 def _utc_timestamp() -> str:
     return datetime.utcnow().isoformat()
-
 
 def _post_callback(url: str, payload: Dict) -> None:
     try:
         requests.post(url, json=payload, timeout=CALLBACK_TIMEOUT)
     except Exception as exc:
         logger.warning("Callback delivery failed: %s", exc)
-
 
 def _run_job(payload: ScraperRequest) -> None:
     callback_url = payload.callbackUrl
