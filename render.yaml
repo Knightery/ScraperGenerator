@@ -3,7 +3,7 @@ services:
     name: scraper-render-worker
     env: python
     buildCommand: |
-      pip install -r api/requirements.txt &&
+      pip install -r requirements.txt &&
       python -m playwright install --with-deps firefox
     startCommand: uvicorn render_worker:app --host 0.0.0.0 --port $PORT
     envVars:
