@@ -501,7 +501,7 @@ class AINavigator:
         prompt = f"""TASK: Navigate to find internship job listings page.
 
 RETURN LOGIC:
-- "STAY" if you see 3+ internship job titles with apply buttons
+- "STAY" if you see internship job titles with apply buttons
 - "BACK" if no internships found or error messages
 - NUMBER (1-N) to click link for internship listings
 - "0" if no relevant links
@@ -509,7 +509,7 @@ RETURN LOGIC:
 INTERNSHIP INDICATORS: "Intern", "Summer", "Co-op", "Graduate Program", "Entry Level"
 AVOID: "VP", "Director", "Senior", "Manager" roles
 
-Context: Website navigation to find scrapable internship listings.
+Context: Website navigation to find scrapable internship listings. Make sure we look for internships and job listings at the actual company, as some companies have job boards for their portfolio companies.
 
 Analyze this careers page: {current_url}
 
@@ -612,9 +612,17 @@ Return 1-2 sentences explaining the issue:"""
         
         prompt = f"""TASK: Determine if search or button interaction is needed to filter for internships/coops/placements/etc. on this job page.
 
-REQUIRED: If TRUE, provide EXACT CSS selectors from HTML below. Support two interaction types:
+REQUIRED: If TRUE, provide EXACT **VALID CSS SELECTORS** from HTML below. Support two interaction types:
 1. SEARCH BAR: Provide search_query + search_input_selector + optional search_submit_selector
 2. BUTTON ONLY: Provide only search_submit_selector (for buttons like "Internships", "Graduate Programs")
+
+CRITICAL RULES FOR SELECTORS:
+- Use ONLY standard CSS selectors (class, id, attribute, type selectors)
+- DO NOT use :contains() - this is jQuery, not CSS
+- DO NOT use :has() unless using simple child selectors like :has(> span)
+- Prefer simple, robust selectors: button[aria-label="..."], a[href*="..."], .class-name
+- For text matching, use attribute selectors like [aria-label*="Intern"] or inspect actual class names in HTML
+- Test your selector mentally: can querySelector() handle it? If no, simplify it.
 
 URL: {url}
 CONTENT: {visible_text}
@@ -624,10 +632,16 @@ Return JSON:
 {{
   "search_required": true/false,
   "search_query": "search term for search bars (e.g. 'intern', 'summer analyst') OR empty string if button-only interaction",
-  "search_input_selector": "exact CSS selector for search input OR empty string if button-only interaction",
-  "search_submit_selector": "exact CSS selector for submit button OR filter button (e.g. 'Internships' button)",
+  "search_input_selector": "VALID CSS selector for search input OR empty string if button-only interaction",
+  "search_submit_selector": "VALID CSS selector for submit button OR filter button (e.g. 'Internships' button)",
   "reasoning": "one sentence explaining the interaction type"
 }}
+
+EXAMPLES OF VALID SELECTORS:
+- button.filter-btn (good)
+- a[href*="internship"] (good)
+- div.chip-container > button:nth-child(3) (good)
+- .MuiChip-clickable:has(span.MuiChip-label:contains("Internships")) (INVALID - uses :contains())
 
 Context: Search/filter interaction for student career opportunity (e.g. co-ops, internships, placement programs) scraping. We want to scrape all types of student opportunities, so only search if necessary to filter out actual jobs. Two modes supported:
 - SEARCH MODE: Use search bar with query + input selector + optional submit selector

@@ -46,7 +46,7 @@ class PlaywrightScraper:
         
         self.playwright = await async_playwright().start()
         
-        self.browser = await self.playwright.firefox.launch(headless=True)
+        self.browser = await self.playwright.firefox.launch(headless=False)
         
         self.context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
@@ -101,7 +101,7 @@ class PlaywrightScraper:
                 await page.goto(url, wait_until='networkidle', timeout=60000)
                 await page.wait_for_load_state("networkidle")
             except Exception as e:
-                self.logger.warning(f"Networkidle timeout, continuing with current page state: {str(e)}")
+                self.logger.warning(f"Networkidle timeout, continuing with current page state: {str(e)}")p
             
             # Wait 5 seconds for all dynamic content to load
             self.logger.info("Waiting 5 seconds for all content to load...")
@@ -205,29 +205,45 @@ class PlaywrightScraper:
             # Extract text-based fields dynamically
             for field_name, selector_key in field_mappings.items():
                 selector = config.get(selector_key, '')
+                
                 if selector:
-                    element = await job_element.query_selector(selector)
-                    if element:
-                        text = await element.text_content() or ''
-                        job_data[field_name] = clean_extracted_text(text)
+                    try:
+                        # Use locator() for Locator objects (returned from filter())
+                        element_locator = job_element.locator(selector).first
+                        # Check if element exists by trying to get text with timeout
+                        try:
+                            text = await element_locator.text_content(timeout=5000) or ''
+                            cleaned_text = clean_extracted_text(text)
+                            job_data[field_name] = cleaned_text
+                        except:
+                            pass  # Element not found, skip
+                    except Exception as e:
+                        self.logger.debug(f"Error extracting {field_name}: {str(e)}")
 
             # Handle URL extraction separately (requires href attribute)
             url_selector = config.get('url_selector', '')
             
-            # --- START OF PROPOSED CHANGE ---
             if url_selector:
-                # Normal case: look for a nested element
-                url_element = await job_element.query_selector(url_selector)
-                if url_element:
-                    href = await url_element.get_attribute('href')
+                try:
+                    # Use locator() for Locator objects (returned from filter())
+                    url_locator = job_element.locator(url_selector).first
+                    # Try to get href with timeout instead of count()
+                    try:
+                        href = await url_locator.get_attribute('href', timeout=5000)
+                        if href:
+                            job_data['url'] = urljoin(base_url, href.strip())
+                    except:
+                        pass  # Element not found, skip
+                except Exception as e:
+                    self.logger.debug(f"Error extracting URL with selector '{url_selector}': {str(e)}")
+            else:
+                try:
+                    # Handle case where the container itself is the link
+                    href = await job_element.get_attribute('href', timeout=5000)
                     if href:
                         job_data['url'] = urljoin(base_url, href.strip())
-            else:
-                # Handle case where the container itself is the link
-                href = await job_element.get_attribute('href')
-                if href:
-                    job_data['url'] = urljoin(base_url, href.strip())
-            # --- END OF PROPOSED CHANGE ---
+                except Exception as e:
+                    self.logger.debug(f"Error extracting URL from container: {str(e)}")
             
         except Exception as e:
             self.logger.debug(f"Error extracting job data: {str(e)}")
