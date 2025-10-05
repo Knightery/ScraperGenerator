@@ -15,7 +15,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from playwright_scraper import PlaywrightScraperSync
 from supabase_database import SupabaseDatabaseManager
 
-
 def setup_logging():
     """Setup logging for the scraper."""
     import os
@@ -29,7 +28,6 @@ def setup_logging():
             logging.StreamHandler()
         ]
     )
-
 
 def get_scraper_config():
     """Get the scraper configuration for {{company_name}}."""

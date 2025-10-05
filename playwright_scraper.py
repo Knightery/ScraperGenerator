@@ -6,11 +6,6 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
-from html_cleaning_utils import clean_html_content_comprehensive
-
-def clean_html_content(html_content: str) -> str:
-    """Clean HTML content by removing irrelevant sections."""
-    return clean_html_content_comprehensive(html_content, logging.getLogger(__name__))
 
 def clean_extracted_text(text: str) -> str:
     """Clean extracted text by removing extra whitespace and newlines."""
@@ -18,7 +13,6 @@ def clean_extracted_text(text: str) -> str:
         return ""
     # Strip whitespace and collapse multiple whitespace/newlines into single spaces
     return ' '.join(text.strip().split())
-
 
 class PlaywrightScraper:
     """
@@ -46,11 +40,23 @@ class PlaywrightScraper:
         
         self.playwright = await async_playwright().start()
         
-        self.browser = await self.playwright.firefox.launch(headless=False)
+        self.browser = await self.playwright.firefox.launch(
+            headless=True,
+            firefox_user_prefs={
+                "javascript.enabled": True,
+                "dom.webdriver.enabled": False,
+                "useAutomationExtension": False,
+            }
+        )
         
         self.context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0',
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
+            }
         )
         
         self.logger.info("Browser started successfully")
@@ -65,7 +71,6 @@ class PlaywrightScraper:
             await self.playwright.stop()
         
         self.logger.info("Browser closed")
-    
     
     async def scrape_jobs(self, url: str, scraper_config: Dict) -> Tuple[List[Dict], str]:
         """
@@ -93,15 +98,13 @@ class PlaywrightScraper:
                 });
             """)
             
-            # Navigate with random delay
-            await asyncio.sleep(1)
+            await asyncio.sleep(3)
             
             # Try networkidle first, but if it times out just continue with whatever loaded
             try:
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-                await page.wait_for_load_state("networkidle")
+                await page.goto(url, wait_until='networkidle', timeout=30000)
             except Exception as e:
-                self.logger.warning(f"Networkidle timeout, continuing with current page state: {str(e)}")p
+                self.logger.warning(f"Timeout after 30s while loading {url}. Proceeding with available page content.")
             
             # Wait 5 seconds for all dynamic content to load
             self.logger.info("Waiting 5 seconds for all content to load...")
@@ -113,6 +116,10 @@ class PlaywrightScraper:
             # Perform search if required
             if scraper_config.get('search_required', False):
                 await self._perform_search_interaction(page, scraper_config)
+                
+                # Wait for dynamic content to load after interaction
+                self.logger.info("Waiting 5 seconds for dynamic content after interaction...")
+                await asyncio.sleep(5)
             
             # Clean the page HTML content and capture it - TEMPORARILY COMMENTED OUT
             # filtered_html = await self._clean_page_content(page)
@@ -139,6 +146,9 @@ class PlaywrightScraper:
         """Extract jobs from the current page using the scraper configuration."""
         jobs = []
         
+        # Always use main page - iframe content is already rendered inline by ai_navigator
+        target_frame = page
+        
         try:
             # Get job containers (dynamic content should already be loaded and HTML cleaned)
             container_selector = config.get('job_container_selector', '')
@@ -157,23 +167,28 @@ class PlaywrightScraper:
                 self.logger.info(f"Applying text filter for keywords: {keywords}")
                 
                 # Filter job containers by text content using Playwright's filter()
-                job_locator = page.locator(container_selector)
+                job_locator = target_frame.locator(container_selector)
+                total_containers = await job_locator.count()
                 filtered_locator = job_locator.filter(has_text=re.compile(keyword_pattern, re.IGNORECASE))
                 job_elements = await filtered_locator.all()
                 
-                self.logger.info(f"Found {len(job_elements)} job containers matching internship keywords")
+                self.logger.info(f"Found {len(job_elements)} job containers matching internship keywords out of {total_containers} total containers")
             else:
-                # Use standard selector (no filtering needed)
-                job_elements = await page.query_selector_all(container_selector)
+                # Use locator().all() to get Locator objects (not ElementHandles)
+                job_elements = await target_frame.locator(container_selector).all()
                 self.logger.info(f"Found {len(job_elements)} job containers (no text filtering)")
             
-            for job_element in job_elements:
+            for idx, job_element in enumerate(job_elements):
                 try:
                     job_data = await self._extract_job_data(job_element, config, base_url)
                     if job_data and job_data.get('title') and job_data.get('url'):
                         jobs.append(job_data)
+                    elif job_data:
+                        self.logger.warning(f"Job container {idx+1}/{len(job_elements)} rejected - missing title or URL. Title: '{job_data.get('title', 'EMPTY')}', URL: '{job_data.get('url', 'EMPTY')}'")
+                    else:
+                        self.logger.warning(f"Job container {idx+1}/{len(job_elements)} rejected - _extract_job_data returned None")
                 except Exception as e:
-                    self.logger.debug(f"Error extracting job data: {str(e)}")
+                    self.logger.warning(f"Error extracting job data from container {idx+1}/{len(job_elements)}: {type(e).__name__}: {str(e)}")
                     continue
             
         except Exception as e:
@@ -208,48 +223,67 @@ class PlaywrightScraper:
                 
                 if selector:
                     try:
-                        # Use locator() for Locator objects (returned from filter())
                         element_locator = job_element.locator(selector).first
-                        # Check if element exists by trying to get text with timeout
-                        try:
-                            text = await element_locator.text_content(timeout=5000) or ''
-                            cleaned_text = clean_extracted_text(text)
-                            job_data[field_name] = cleaned_text
-                        except:
-                            pass  # Element not found, skip
+                        text = await element_locator.text_content(timeout=100) or ''
+                        cleaned_text = clean_extracted_text(text)
+                        job_data[field_name] = cleaned_text
+                        if cleaned_text:
+                            self.logger.debug(f"Extracted {field_name}: {cleaned_text[:50]}...")
+                        else:
+                            self.logger.debug(f"Extracted {field_name} but result was empty after cleaning")
                     except Exception as e:
-                        self.logger.debug(f"Error extracting {field_name}: {str(e)}")
+                        self.logger.warning(f"Failed to extract {field_name} using selector '{selector}': {type(e).__name__}: {str(e)}")
+                        pass  # Element not found, skip
+                else:
+                    if field_name == 'title':
+                        self.logger.warning(f"No {selector_key} configured in scraper config!")
 
             # Handle URL extraction separately (requires href attribute)
             url_selector = config.get('url_selector', '')
+            url_extracted = False
             
-            if url_selector:
+            # Try container first (common case: container IS the <a> tag)
+            try:
+                href = await job_element.get_attribute('href', timeout=1000)
+                if href:
+                    job_data['url'] = urljoin(base_url, href.strip())
+                    self.logger.debug(f"Extracted URL from container href: {job_data['url']}")
+                    url_extracted = True
+            except Exception as e:
+                self.logger.debug(f"Container href extraction failed: {type(e).__name__}")
+            
+            # If container didn't have href, try child element with url_selector
+            if not url_extracted and url_selector:
                 try:
-                    # Use locator() for Locator objects (returned from filter())
                     url_locator = job_element.locator(url_selector).first
-                    # Try to get href with timeout instead of count()
-                    try:
-                        href = await url_locator.get_attribute('href', timeout=5000)
-                        if href:
-                            job_data['url'] = urljoin(base_url, href.strip())
-                    except:
-                        pass  # Element not found, skip
-                except Exception as e:
-                    self.logger.debug(f"Error extracting URL with selector '{url_selector}': {str(e)}")
-            else:
-                try:
-                    # Handle case where the container itself is the link
-                    href = await job_element.get_attribute('href', timeout=5000)
+                    href = await url_locator.get_attribute('href', timeout=1000)
                     if href:
                         job_data['url'] = urljoin(base_url, href.strip())
-                except Exception as e:
-                    self.logger.debug(f"Error extracting URL from container: {str(e)}")
+                        self.logger.debug(f"Extracted URL from selector '{url_selector}': {job_data['url']}")
+                        url_extracted = True
+                except Exception as e2:
+                    self.logger.warning(f"Failed to extract URL using selector '{url_selector}': {type(e2).__name__}: {str(e2)}")
+            
+            # Warn if no URL was extracted
+            if not url_extracted:
+                if not url_selector:
+                    self.logger.warning(f"No URL extracted - container has no href and no url_selector provided in config")
+                else:
+                    self.logger.warning(f"No URL extracted - both container href and url_selector '{url_selector}' failed")
             
         except Exception as e:
-            self.logger.debug(f"Error extracting job data: {str(e)}")
+            self.logger.error(f"Unexpected error extracting job data: {type(e).__name__}: {str(e)}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return None
 
-        return job_data if job_data['title'] else None
+        # Debug log final extracted data
+        if not job_data['title']:
+            self.logger.warning(f"Job rejected - no title extracted. URL: {job_data.get('url', 'N/A')}, Config selectors: title_selector='{config.get('title_selector', 'MISSING')}'")
+        elif not job_data['url']:
+            self.logger.warning(f"Job rejected - no URL extracted. Title: '{job_data['title']}', Config selectors: url_selector='{config.get('url_selector', 'MISSING')}'")
+        
+        return job_data if (job_data['title'] and job_data['url']) else None
     
     async def _handle_pagination(self, page: Page, config: Dict, base_url: str, initial_jobs: List[Dict] = None) -> List[Dict]:
         """Handle intelligent pagination until end conditions are met."""
@@ -322,7 +356,7 @@ class PlaywrightScraper:
                 try:
                     await page.wait_for_load_state("networkidle", timeout=10000)
                 except Exception as e:
-                    self.logger.warning(f"Networkidle timeout on page {page_num}, continuing: {str(e)}")
+                    self.logger.warning(f"Timeout while waiting for page {page_num}. Proceeding with available content.")
                 
                 await asyncio.sleep(5)
                 
@@ -422,11 +456,14 @@ class PlaywrightScraper:
             self.logger.warning("Search required but insufficient selectors provided (need either button selector OR input selector + query)")
             return
         
+        # Always use main page - iframe content is already rendered inline by ai_navigator
+        target_frame = page
+        
         try:
             if is_button_mode:
                 # BUTTON MODE: Click filter/category button directly
                 self.logger.info(f"Performing button interaction: clicking '{search_submit_selector}'")
-                await page.click(search_submit_selector)
+                await target_frame.locator(search_submit_selector).click()
                 self.logger.info("Clicked filter button successfully")
                 
             elif is_search_mode:
@@ -434,15 +471,15 @@ class PlaywrightScraper:
                 self.logger.info(f"Performing search interaction with query: '{search_query}'")
                 
                 # Fill search input with custom search query
-                await page.fill(search_input_selector, search_query)
+                await target_frame.locator(search_input_selector).fill(search_query)
                 self.logger.info(f"Filled search input with '{search_query}'")
                 
                 # Submit search
                 if search_submit_selector:
-                    await page.click(search_submit_selector)
+                    await target_frame.locator(search_submit_selector).click()
                     self.logger.info("Clicked search submit button")
                 else:
-                    await page.press(search_input_selector, 'Enter')
+                    await target_frame.locator(search_input_selector).press('Enter')
                     self.logger.info("Pressed Enter to submit search")
             
             # Wait for results to load (both modes)
@@ -473,10 +510,9 @@ class PlaywrightScraper:
         
         try:
             try:
-                await page.goto(url, wait_until='networkidle', timeout=60000)
-                await page.wait_for_load_state("networkidle")
+                await page.goto(url, wait_until='networkidle', timeout=30000)
             except Exception as e:
-                self.logger.warning(f"Networkidle timeout, continuing with current page state: {str(e)}")
+                self.logger.warning(f"Timeout after 30s while loading {url}. Proceeding with available page content.")
             
             results = {
                 'url': url,

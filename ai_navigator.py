@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urljoin
@@ -11,7 +12,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel
 from config import Config
 from html_cleaning_utils import clean_html_content_comprehensive
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
 from playwright_scraper import PlaywrightScraperSync
 
 load_dotenv()
@@ -49,8 +50,7 @@ class AINavigator:
             raise ValueError("GEMINI_API_KEY must be provided for AINavigator")
 
         self.client = genai.Client(api_key=self._gemini_api_key)
-        self._page_cache = {}  # Cache for cleaned page content
-        self._content_cache = {}  # Cache for raw page content
+        self._page_cache = {}  # Cache for cleaned page content (cleared before analysis phase)
         self._navigation_history = []  # Track navigation history for back functionality
         self._rejected_pages = {}  # Track pages that were rejected and why
         # Persistent browser session for navigation and content fetching
@@ -126,7 +126,6 @@ class AINavigator:
                     "javascript.enabled": True,
                     "dom.webdriver.enabled": False,
                     "useAutomationExtension": False,
-                    "general.useragent.override": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0"
                 }
             )
             self._context = self._browser.new_context(
@@ -211,7 +210,12 @@ class AINavigator:
                 self._emit_progress({'stage': 'analysis', 'message': 'Failed to load internship page content', 'status': 'error'})
                 return {"error": "Could not access internship page content"}
             
-            # Get cleaned HTML for analysis
+            # Clear page cache IMMEDIATELY before extracting content to ensure fresh HTML cleaning
+            # This prevents returning stale cached cleaned content from previous runs
+            self._page_cache.clear()
+            self.logger.info("Cleared page cache before content extraction to ensure fresh HTML")
+            
+            # Get cleaned HTML for analysis (will not use cache due to clear above)
             content_data = self._extract_clean_content_and_links(page_content, internship_url)
             html_structure = content_data['cleaned_html']
             
@@ -236,22 +240,16 @@ class AINavigator:
                     self.logger.info("Search performed successfully, content updated in place")
                     self._emit_progress({'stage': 'navigation', 'message': 'Search interaction filtered listings'})
                 
-                # Use the fresh content from search result (regardless of URL change)
-                updated_content = search_analysis.get('updated_content')
-                if updated_content:
-                    self.logger.info("Using fresh content from search results")
-                    self._emit_preview('navigation', 'Search results updated')
-                    content_data = self._extract_clean_content_and_links(updated_content, internship_url)
-                    html_structure = content_data['cleaned_html']
-                else:
-                    self.logger.warning("No updated content returned from search, fetching fresh content")
-                    # Fallback: clear cache and get fresh content
-                    if internship_url in self._content_cache:
-                        del self._content_cache[internship_url]
-                    new_page_content = self._get_page_content(internship_url)
-                    if new_page_content:
-                        content_data = self._extract_clean_content_and_links(new_page_content, internship_url)
-                        html_structure = content_data['cleaned_html']
+                # Clear caches and get fresh content after search interaction
+                self._page_cache.clear()
+                self.logger.info("Cleared caches after search interaction")
+                
+                # Get fresh content from the page (browser state has been updated by search)
+                fresh_page_content = self._page.content()
+                self.logger.info("Retrieved fresh content from browser after search")
+                self._emit_preview('navigation', 'Search results updated')
+                content_data = self._extract_clean_content_and_links(fresh_page_content, internship_url)
+                html_structure = content_data['cleaned_html']
             
             # Retry loop for AI analysis and validation only
             previous_feedback = None
@@ -342,7 +340,6 @@ class AINavigator:
             self._navigation_history = []
             self._rejected_pages = {}
             self._page_cache = {}
-            self._content_cache = {}
             
             # Restart navigation with the new URL
             return self._find_internship_page(search_engine_url)
@@ -381,7 +378,6 @@ class AINavigator:
             self._navigation_history = []
             self._rejected_pages = {}
             self._page_cache = {}
-            self._content_cache = {}
             
             # Restart navigation with the new URL
             return self._find_internship_page(search_engine_url)
@@ -412,6 +408,7 @@ class AINavigator:
         
         # Use comprehensive HTML cleaning function
         cleaned_html_str = clean_html_content_comprehensive(page_content, self.logger)
+        #cleaned_html_str = page_content
         
         # Safety check for None return
         if cleaned_html_str is None:
@@ -419,7 +416,7 @@ class AINavigator:
             cleaned_html_str = page_content
         
         # Export cleaned HTML for debugging - testing only
-        #self._export_cleaned_html(cleaned_html_str, base_url)
+        self._export_cleaned_html(cleaned_html_str, base_url)
         
         # Extract visible text from cleaned content
         cleaned_soup = BeautifulSoup(cleaned_html_str, 'html.parser')
@@ -469,22 +466,28 @@ class AINavigator:
         visible_text = content_data['visible_text']
         links = content_data['links']
         
+        # Don't return early if no links - we still want to allow BACK option
         if not links:
-            self.logger.info("No links found for navigation")
-            return current_url
+            self.logger.info("No links found for navigation - will still evaluate BACK option")
         
-        # Filter links containing job-related keywords first
-        job_keywords = ['jobs', 'intern', 'oppor', 'career']  # oppor catches opportunity/opportunities
-        filtered_links = [link for link in links 
-                         if any(keyword in link['text'].lower() or keyword in link['url'].lower() 
-                               for keyword in job_keywords)]
+        # Filter links containing job-related keywords first (only if links exist)
+        relevant_links = []
+        if links:
+            job_keywords = ['jobs', 'intern', 'oppor', 'career']  # oppor catches opportunity/opportunities
+            filtered_links = [link for link in links 
+                             if any(keyword in link['text'].lower() or keyword in link['url'].lower() 
+                                   for keyword in job_keywords)]
+            
+            # Use filtered links if found, otherwise use all links
+            relevant_links = filtered_links if filtered_links else links
+            self.logger.info(f"Using {'filtered' if filtered_links else 'all'} links: {len(relevant_links)}/{len(links)}")
         
-        # Use filtered links if found, otherwise use all links
-        relevant_links = filtered_links if filtered_links else links
-        self.logger.info(f"Using {'filtered' if filtered_links else 'all'} links: {len(relevant_links)}/{len(links)}")
-        
-        links_text = "\n".join(f"{i}. \"{link['text']}\" -> {link['url']}" 
-                              for i, link in enumerate(relevant_links, 1))
+        # Build links text
+        if relevant_links:
+            links_text = "\n".join(f"{i}. \"{link['text']}\" -> {link['url']}" 
+                                  for i, link in enumerate(relevant_links, 1))
+        else:
+            links_text = "(No clickable links found on this page)"
         
         # Always allow BACK navigation
         can_go_back = len(self._navigation_history) > 1
@@ -502,9 +505,8 @@ class AINavigator:
 
 RETURN LOGIC:
 - "STAY" if you see internship job titles with apply buttons
-- "BACK" if no internships found or error messages
-- NUMBER (1-N) to click link for internship listings
-- "0" if no relevant links
+- "BACK" if no internships found, error messages, or no relevant links
+- NUMBER (1-N) to click link for internship listings (only if links are available)
 
 INTERNSHIP INDICATORS: "Intern", "Summer", "Co-op", "Graduate Program", "Entry Level"
 AVOID: "VP", "Director", "Senior", "Manager" roles
@@ -521,7 +523,7 @@ AVAILABLE LINKS TO CLICK:
 
 Does this page show specific internship job listings, or do I need to click a link to find them, or should I go back?
 
-Response (ONLY return 'STAY', 'BACK', a number 1-N, or '0'):"""
+Response (ONLY return 'STAY', 'BACK', or a number 1-N):"""
         
         for attempt in range(3):
             response_text = self._llm_query(prompt).upper().strip()
@@ -542,15 +544,14 @@ Response (ONLY return 'STAY', 'BACK', a number 1-N, or '0'):"""
                         # Use browser's back functionality
                         self._page.go_back(wait_until='networkidle')
                         
+                        # Add 5-second buffer after back navigation for dynamic content
+                        time.sleep(5)
+                        
                         # Update navigation history to reflect the back navigation
                         self._navigation_history.pop()  # Remove current URL
                         back_url = self._page.url
                         
                         self.logger.info(f"Browser navigated back to: {back_url}")
-                        
-                        # Update content cache with the back page content
-                        back_content = self._page.content()
-                        self._content_cache[back_url] = back_content
                         
                         return back_url
                     else:
@@ -572,9 +573,6 @@ Response (ONLY return 'STAY', 'BACK', a number 1-N, or '0'):"""
                         selected_url = selected_link['url']
                         self.logger.info(f"AI selected link {selection}: '{selected_link['text']}' -> {selected_url}")
                         return selected_url
-                    elif selection == 0:
-                        self.logger.info("AI selected 0 - no relevant links")
-                        return current_url
                     else:
                         raise ValueError(f"Invalid selection: {selection}")
             except (ValueError, TypeError) as e:
@@ -610,57 +608,65 @@ Return 1-2 sentences explaining the issue:"""
         visible_text = content_data['visible_text'][:8000]
         html_structure = content_data['cleaned_html'][:100000]
         
-        prompt = f"""TASK: Determine if search or button interaction is needed to filter for internships/coops/placements/etc. on this job page.
+        prompt = f"""You are a web scraping expert. Analyze this job board page and determine if interaction is needed to filter for internship/co-op positions. 
 
-REQUIRED: If TRUE, provide EXACT **VALID CSS SELECTORS** from HTML below. Support two interaction types:
-1. SEARCH BAR: Provide search_query + search_input_selector + optional search_submit_selector
-2. BUTTON ONLY: Provide only search_submit_selector (for buttons like "Internships", "Graduate Programs")
+**SELECTOR REQUIREMENTS - CRITICAL:**
+Your selector MUST match EXACTLY ONE element. Multi-match selectors will fail.
 
-CRITICAL RULES FOR SELECTORS:
-- Use ONLY standard CSS selectors (class, id, attribute, type selectors)
-- DO NOT use :contains() - this is jQuery, not CSS
-- DO NOT use :has() unless using simple child selectors like :has(> span)
-- Prefer simple, robust selectors: button[aria-label="..."], a[href*="..."], .class-name
-- For text matching, use attribute selectors like [aria-label*="Intern"] or inspect actual class names in HTML
-- Test your selector mentally: can querySelector() handle it? If no, simplify it.
+**Uniqueness strategies:**
+1. **Scope to container**: `.filter-section button[text="Internships"]` not just `button`
+2. **Use unique attributes**: `[data-filter="intern"]`, `[aria-label="Internships"]`, `#intern-filter`
+3. **Combine multiple selectors**: `.quick-links a.filter-btn[href*="intern"]`
+4. **Use structural position**: `.sidebar > div:first-child button` (when structure is stable)
+5. **Use :first-of-type**: When absolutely necessary to disambiguate
 
-URL: {url}
-CONTENT: {visible_text}
-HTML: {html_structure}
+**Before finalizing - ASK YOURSELF:**
+- Will URL parameters added to ALL page links match this? (e.g., `?category=intern` on every link)
+- Is this scoped to the FILTER UI, not the job results area?
+- Does this uniquely identify ONE interactive element?
 
-Return JSON:
+**Supported interactions:**
+1. SEARCH MODE: Fill text input then submit
+   - Requires: `search_input_selector` (input[type="text/search"]) + `search_query`
+   - Optional: `search_submit_selector` (submit button)
+   
+2. BUTTON MODE: Click one filter/category button
+   - Requires: `search_submit_selector` (button/link that applies internship filter)
+   - Leave search_query and search_input_selector empty
+
+**NOT supported (return search_required=false):**
+- Dropdown menus (<select>)
+- Checkboxes/radio buttons
+- Multi-step filter forms
+
+**URL:** {url}
+
+You should not use the URL primarily in order to come up with the decision on if you should search or not, and it is purely for context and supplemental information.
+
+**PAGE TEXT:**
+{visible_text}
+
+**HTML STRUCTURE:**
+{html_structure}
+
+**Your response (JSON only):**
 {{
   "search_required": true/false,
-  "search_query": "search term for search bars (e.g. 'intern', 'summer analyst') OR empty string if button-only interaction",
-  "search_input_selector": "VALID CSS selector for search input OR empty string if button-only interaction",
-  "search_submit_selector": "VALID CSS selector for submit button OR filter button (e.g. 'Internships' button)",
-  "reasoning": "one sentence explaining the interaction type"
-}}
-
-EXAMPLES OF VALID SELECTORS:
-- button.filter-btn (good)
-- a[href*="internship"] (good)
-- div.chip-container > button:nth-child(3) (good)
-- .MuiChip-clickable:has(span.MuiChip-label:contains("Internships")) (INVALID - uses :contains())
-
-Context: Search/filter interaction for student career opportunity (e.g. co-ops, internships, placement programs) scraping. We want to scrape all types of student opportunities, so only search if necessary to filter out actual jobs. Two modes supported:
-- SEARCH MODE: Use search bar with query + input selector + optional submit selector
-- BUTTON MODE: Click filter/category button directly (search_query and search_input_selector will be empty)
-Look for dedicated filter buttons, category links, or search functionality."""
+  "search_query": "search term (empty if button mode)",
+  "search_input_selector": "UNIQUE selector for text input (empty if button mode)",
+  "search_submit_selector": "UNIQUE selector for submit button or filter link",
+  "reasoning": "Explain your selector choice and why it matches exactly one element"
+}}"""
 
         result = json.loads(self._llm_query(prompt, json_response=True))
         self.logger.info(f"LLM search analysis: {result}")
         return result
     
     def _perform_search(self, url: str, search_analysis: Dict) -> Optional[Dict]:
-        """Perform search or button interaction."""
+        """Perform search or button interaction with selector validation."""
         search_query = search_analysis.get('search_query', '')
         input_selector = search_analysis.get('search_input_selector', '')
         submit_selector = search_analysis.get('search_submit_selector', '')
-        
-        # Support two interaction modes:
-        # 1. BUTTON MODE: Only submit_selector provided (e.g., "Internships" filter button)
-        # 2. SEARCH MODE: input_selector + query provided
         
         is_button_mode = not input_selector and not search_query and submit_selector
         is_search_mode = input_selector and search_query
@@ -677,31 +683,49 @@ Look for dedicated filter buttons, category links, or search functionality."""
         
         # Perform interaction based on mode
         if is_button_mode:
-            self._page.evaluate(f"document.querySelector('{submit_selector}').click()")
+            # BUTTON MODE: Click a single button or link
+            try:
+                self.logger.info(f"Clicking button/link: {submit_selector}")
+                self._page.locator(submit_selector).click(timeout=10000)
+            except Exception as e:
+                self.logger.error(f"Failed to click button/link {submit_selector}: {e}")
+                return None
         elif is_search_mode:
-            # SEARCH MODE: Fill input and submit
-            self._page.fill(input_selector, search_query)
+            # SEARCH MODE: Fill text input and submit
+            try:
+                self.logger.info(f"Filling search input '{input_selector}' with query '{search_query}'")
+                self._page.locator(input_selector).fill(search_query)
+                
+                if submit_selector:
+                    self.logger.info(f"Clicking submit button: {submit_selector}")
+                    self._page.locator(submit_selector).click(timeout=10000)
+                else:
+                    self.logger.info("Pressing Enter to submit")
+                    self._page.locator(input_selector).press('Enter')
+            except Exception as e:
+                self.logger.error(f"Failed to perform search: {e}")
+                return None
+        
+        # Wait 3 seconds for potential delayed URL changes
+        self.logger.info("Waiting 3 seconds for potential URL changes after interaction...")
+        time.sleep(3)
             
-            if submit_selector:
-                self._page.evaluate(f"document.querySelector('{submit_selector}').click()")
-            else:
-                self._page.press(input_selector, 'Enter')
-            
-        self._page.wait_for_load_state('networkidle')
+        try:
+            self._page.wait_for_load_state('networkidle', timeout=15000)
+        except PlaywrightTimeoutError:
+            self.logger.warning(
+                "Timeout while waiting for results after interaction on %s. Proceeding with available content.",
+                url
+            )
         
         # Get results
         current_url = self._page.url
-        content = self._page.content()
-        
-        # Always cache and return results - no verification needed
-        self._content_cache[current_url] = content
         
         result = {
             'search_performed': True, 
             'search_input_selector': input_selector,
             'search_submit_selector': submit_selector,
             'search_query': search_query,
-            'updated_content': content,
             'interaction_mode': 'button' if is_button_mode else 'search'
         }
         
@@ -709,19 +733,106 @@ Look for dedicated filter buttons, category links, or search functionality."""
             result['new_url'] = current_url
         
         return result
+    
+    def _render_iframes_inline(self, html_content: str) -> str:
+        """Render iframe contents inline so LLM can analyze them.
+        
+        Replaces <iframe> tags with their actual rendered content, wrapped in special markers
+        that indicate frame boundaries and URLs.
+        
+        Returns:
+            HTML with iframe contents embedded inline
+        """
+        frames = self._page.frames
+        
+        if len(frames) <= 1:
+            self.logger.debug("No iframes to render")
+            return html_content
+        
+        self.logger.info(f"Rendering {len(frames)-1} iframe(s) inline for LLM analysis")
+        
+        soup = BeautifulSoup(html_content, 'html.parser')
+        iframe_tags = soup.find_all('iframe')
+        
+        # Map iframe src/URL to actual frame content
+        frame_map = {}
+        for frame in frames[1:]:  # Skip main frame
+            if frame.url and frame.url != 'about:blank':
+                try:
+                    frame_content = frame.content()
+                    frame_map[frame.url] = frame_content
+                    self.logger.debug(f"Extracted content from iframe: {frame.url[:100]}")
+                except Exception as e:
+                    self.logger.warning(f"Failed to extract iframe content from {frame.url}: {e}")
+        
+        # Replace each iframe tag with its rendered content
+        for idx, iframe_tag in enumerate(iframe_tags):
+            iframe_src = iframe_tag.get('src', '')
+            
+            # Try to find matching frame content by URL
+            frame_content = None
+            frame_url = None
+            for f_url, content in frame_map.items():
+                # Match by exact URL or if iframe src is relative and matches end of frame URL
+                if iframe_src in f_url or f_url.endswith(iframe_src):
+                    frame_content = content
+                    frame_url = f_url
+                    break
+            
+            if frame_content:
+                # Create a marker div that wraps the iframe content
+                marker_start = soup.new_tag('div')
+                marker_start['data-iframe-boundary'] = 'start'
+                marker_start['data-iframe-index'] = str(idx)
+                marker_start['data-iframe-url'] = frame_url
+                marker_start.string = f"<!-- IFRAME START: {frame_url} -->"
+                
+                # Parse iframe content
+                iframe_soup = BeautifulSoup(frame_content, 'html.parser')
+                
+                marker_end = soup.new_tag('div')
+                marker_end['data-iframe-boundary'] = 'end'
+                marker_end['data-iframe-index'] = str(idx)
+                marker_end.string = f"<!-- IFRAME END -->"
+                
+                # Replace iframe tag with: marker_start + iframe_content + marker_end
+                iframe_tag.insert_before(marker_start)
+                iframe_tag.insert_before(iframe_soup)
+                iframe_tag.insert_before(marker_end)
+                iframe_tag.decompose()  # Remove original iframe tag
+                
+                self.logger.info(f"Rendered iframe {idx} inline: {frame_url}")
+            else:
+                self.logger.debug(f"No content found for iframe: {iframe_src}")
+        
+        return str(soup)
        
     def _get_page_content(self, url: str) -> Optional[str]:
-        """Get page content with caching."""
-        if url in self._content_cache:
-            return self._content_cache[url]
-            
+        """Get page content from browser. Renders iframe contents inline for LLM analysis."""
         self._start_browser()
         self._emit_progress({'stage': 'navigation', 'message': f'Loading {url}'})
-        self._page.goto(url, wait_until='networkidle')
+
+        try:
+            self._page.goto(url, wait_until='networkidle', timeout=30000)
+        except PlaywrightTimeoutError:
+            self.logger.warning(
+                "Timeout after 30s while loading %s. Proceeding with available page content.",
+                url
+            )
+
+        # Add mandatory 5-second buffer after networkidle to allow dynamic content to fully render
+        self.logger.info("Waiting 5 seconds for dynamic content to render after networkidle...")
+        time.sleep(5)
+
         self._emit_preview('navigation', f'Loaded {url}')
-        content = self._page.content()
-        self._content_cache[url] = content
-        return content
+        
+        # Get main page content
+        main_content = self._page.content()
+        
+        # Render iframes inline so LLM can see their content
+        enriched_content = self._render_iframes_inline(main_content)
+        
+        return enriched_content
     
     def _generate_analysis_system_prompt(self, is_retry: bool = False) -> str:
         """Generate system prompt for AI analysis."""
@@ -765,7 +876,7 @@ Return JSON with exact keys:
   "location_selector": "CSS selector for locations (or empty)",
   "pagination_selector": "CSS selector for next page (or empty)",
   "has_dynamic_loading": true/false,
-  "text_filter_keywords": "comma-separated keywords to filter job titles for internships only (e.g. 'intern,summer,co-op'). Uses substring matching, so 'intern' matches both 'intern' and 'internship'. All keywords checked with OR logic. Leave empty if page already shows only internships"
+  "text_filter_keywords": "comma-separated keywords to filter job titles for internships only (e.g. 'intern,summer,co-op'). Uses substring matching, so 'intern' matches both 'intern' and 'internship'. All keywords checked with OR logic. Leave empty if page already shows ONLY internships, fill if there are senior-level positions."
 }
 
 CONSTRAINTS:
@@ -806,7 +917,9 @@ URL: {url}
 HTML STRUCTURE:
 {html_structure}
 
-Identify specific CSS selectors for scraping internship job listings. Look for repeating HTML patterns that contain job titles, locations, and apply links."""
+Identify specific CSS selectors for scraping internship job listings. Look for repeating HTML patterns that contain job titles, locations, and apply links.
+
+"""
     
     def _process_analysis_response(self, response) -> Dict:
         """Process Gemini API response and convert to dict format."""
@@ -903,6 +1016,7 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
                     'search_input_selector': analysis.get('search_input_selector', ''),  # Added by search detection, not AI
                     'search_submit_selector': analysis.get('search_submit_selector', ''),  # Added by search detection, not AI
                     'search_query': analysis.get('search_query', 'intern'),  # Added by search detection, not AI
+                    'text_filter_keywords': analysis.get('text_filter_keywords', ''),  # From AI analysis
                     'max_pages': 1  # Only test first page for validation
                 }
                 
@@ -930,7 +1044,6 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
             self.logger.error(f"PlaywrightScraper validation failed: {str(e)}")
             self._emit_progress({'stage': 'validation', 'message': str(e), 'status': 'error'})
             return {"success": False, "error": f"Validation failed: {str(e)}"}
-    
     
     def _llm_evaluate_config(self, analysis: Dict, jobs: List[Dict], html_structure: str, url: str) -> Dict:
         """Let LLM evaluate the config based on all test results."""
@@ -1026,7 +1139,6 @@ Evaluate the configuration quality and recommend if retry is needed."""
     
     def generate_scraper_script(self, company_name: str, url: str, analysis: Dict) -> str:
         """Generate a standalone Python script that uses PlaywrightScraper."""
-        scrape_url = analysis.get("final_url", url)
         
         # Read the template file
         template_path = os.path.join(os.path.dirname(__file__), 'scraper_template.py')
@@ -1035,6 +1147,25 @@ Evaluate the configuration quality and recommend if retry is needed."""
         
         # Prepare template variables using base config
         template_vars = self._build_base_config(company_name, url, analysis)
+        
+        # Use repr() for proper string escaping (best practice for Python string literals)
+        # This handles all special characters correctly, not just single quotes
+        selector_keys = [
+            'job_container_selector', 'title_selector', 'url_selector', 
+            'description_selector', 'location_selector', 'requirements_selector',
+            'pagination_selector', 'search_input_selector', 'search_submit_selector',
+            'search_query', 'text_filter_keywords'
+        ]
+        for key in selector_keys:
+            if key in template_vars and isinstance(template_vars[key], str):
+                # repr() produces a properly escaped Python string literal
+                # Then strip the outer quotes that repr() adds since template has its own quotes
+                template_vars[key] = repr(template_vars[key])[1:-1]
+        
+        # Also escape company_name and URLs that go into strings
+        for key in ['company_name', 'scrape_url']:
+            if key in template_vars and isinstance(template_vars[key], str):
+                template_vars[key] = repr(template_vars[key])[1:-1]
         
         # Add template-specific fields
         template_vars.update({
