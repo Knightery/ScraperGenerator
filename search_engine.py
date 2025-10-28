@@ -17,9 +17,6 @@ class SearchEngine:
         self.logger = logging.getLogger(__name__)
         self.gemini_api_key = gemini_api_key or os.getenv('GEMINI_API_KEY')
         
-        if not self.api_key:
-            raise ValueError("BRAVE_API_KEY not found in environment variables")
-    
     def search_company_jobs(self, company_name: str, search_terms: List[str] = None) -> Optional[str]:
         """
         Search for a company's job board URL.
@@ -180,6 +177,7 @@ Avoid URLs from:
 - General company information pages
 - Blog posts or news articles
 - Social media pages
+- Job boards hosted by the website. This is common for venture capital firms, ensure we navigate to the job board of the actual company.
 
 Select the best URL for finding {company_name} internship job listings:
 

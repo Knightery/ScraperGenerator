@@ -8,7 +8,16 @@ from bs4 import BeautifulSoup, Comment
 
 def contains_pagination(element):
     """Check if element contains the word 'pagination' anywhere in its HTML."""
-    return 'pagination' in str(element).lower()
+    if element is None:
+        return False
+    # Check if element has a None name (happens with decomposed/invalid elements)
+    if not hasattr(element, 'name') or element.name is None:
+        return False
+    try:
+        return 'pagination' in str(element).lower()
+    except (TypeError, AttributeError):
+        # Handle cases where element can't be converted to string
+        return False
 
 
 def clean_non_pagination_children(element):
@@ -17,6 +26,9 @@ def clean_non_pagination_children(element):
     
     # Check direct children
     for child in element.find_all(recursive=False):
+        # Skip if child is already invalid/decomposed
+        if not hasattr(child, 'name') or child.name is None:
+            continue
         if not contains_pagination(child):
             # Check if this child is part of pagination structure (common pagination elements)
             is_pagination_related = False
@@ -68,7 +80,8 @@ def clean_non_pagination_children(element):
     
     # Remove children that don't have pagination
     for child in children_to_remove:
-        child.decompose()
+        if hasattr(child, 'extract'):
+            child.extract()
 
 
 def clean_irrelevant_tags_with_pagination_preservation(soup, irrelevant_tags, logger=None):
@@ -82,8 +95,11 @@ def clean_irrelevant_tags_with_pagination_preservation(soup, irrelevant_tags, lo
     """
     for tag_name in irrelevant_tags:
         for element in soup.find_all(tag_name):
+            # Skip if element is already invalid
+            if not hasattr(element, 'name') or element.name is None:
+                continue
             if not contains_pagination(element):
-                element.decompose()
+                element.extract()
             else:
                 if logger:
                     logger.debug(f"Preserving <{tag_name}> tag because it contains pagination, cleaning non-pagination children")
@@ -104,8 +120,11 @@ def clean_irrelevant_selectors_with_pagination_preservation(soup, irrelevant_sel
     """
     for selector in irrelevant_selectors:
         for element in soup.select(selector):
+            # Skip if element is already invalid
+            if not hasattr(element, 'name') or element.name is None:
+                continue
             if not contains_pagination(element):
-                element.decompose()
+                element.extract()
             else:
                 if logger:
                     logger.debug(f"Preserving element matching '{selector}' because it contains pagination, cleaning non-pagination children")
@@ -222,9 +241,8 @@ def clean_html_content_comprehensive(html_content: str, logger=None) -> str:
         return cleaned_html_str
         
     except Exception as e:
-        error_msg = f"Error cleaning HTML content: {str(e)}"
         if logger:
-            logger.warning(error_msg)
+            logger.warning(f"Error cleaning HTML content: {type(e).__name__}: {str(e)}")
         else:
-            print(error_msg)
+            print(f"Error cleaning HTML content: {type(e).__name__}: {str(e)}")
         return html_content

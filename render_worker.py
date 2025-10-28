@@ -2,7 +2,7 @@ import logging
 import os
 import threading
 from datetime import datetime
-from typing import Dict
+from queue import Queue
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -20,7 +20,9 @@ logger = logging.getLogger("render-worker")
 app = FastAPI(title="Scraper Render Worker", version="1.0.0")
 
 INTERNAL_TOKEN = os.getenv("INTERNAL_RENDER_TOKEN")
-CALLBACK_TIMEOUT = int(os.getenv("RENDER_CALLBACK_TIMEOUT", "15"))
+
+# Simple job queue
+job_queue: Queue = Queue()
 
 
 class ScraperRequest(BaseModel):
@@ -31,91 +33,109 @@ class ScraperRequest(BaseModel):
 
 class ScraperResponse(BaseModel):
     jobId: str
-    status: str = "accepted"
+    queuePosition: int
 
-def _utc_timestamp() -> str:
-    return datetime.utcnow().isoformat()
 
-def _post_callback(url: str, payload: Dict) -> None:
+def _post_callback(url: str, payload: dict) -> None:
+    """Send callback to Vercel."""
     try:
-        requests.post(url, json=payload, timeout=CALLBACK_TIMEOUT)
+        requests.post(url, json=payload, timeout=10)
     except Exception as exc:
-        logger.warning("Callback delivery failed: %s", exc)
+        logger.warning(f"Callback failed: {exc}")
+
 
 def _run_job(payload: ScraperRequest) -> None:
-    callback_url = payload.callbackUrl
-    company = payload.company
-    job_id = payload.jobId
-
-    def emit(progress: Dict) -> None:
+    """Execute a single scraper job."""
+    def emit(progress: dict) -> None:
         event = {
-            "company": company,
-            "jobId": job_id,
+            "company": payload.company,
+            "jobId": payload.jobId,
+            "timestamp": datetime.utcnow().isoformat(),
             **progress,
         }
-        event.setdefault("timestamp", _utc_timestamp())
-        event.setdefault("type", event.get("stage", "update"))
-        event.setdefault("status", event.get("status", "info"))
-        _post_callback(callback_url, event)
+        _post_callback(payload.callbackUrl, event)
 
-    emit({
-        "stage": "render-dispatch",
-        "message": "Render worker accepted job",
-    })
+    emit({"stage": "running", "message": f"Processing {payload.company}"})
 
     try:
         scraper = CompanyJobScraper(
             gemini_api_key=payload.geminiApiKey,
-            progress_callback=lambda evt: emit(dict(evt)),
+            progress_callback=emit,
         )
         success = scraper.add_company(
             payload.company,
             gemini_api_key=payload.geminiApiKey,
-            progress_callback=lambda evt: emit(dict(evt)),
+            progress_callback=emit,
         )
+        
         emit({
             "type": "finalized",
             "stage": "finalized",
             "status": "success" if success else "error",
-            "message": "Workflow finished" if success else "Workflow ended with errors",
+            "message": "Workflow finished" if success else "Workflow failed",
         })
     except Exception as exc:
-        logger.exception("Scraper job failed: %s", exc)
+        logger.exception(f"Job {payload.jobId} failed: {exc}")
         emit({
             "type": "error",
             "stage": "error",
             "status": "error",
             "message": str(exc),
         })
-        emit({
-            "type": "finalized",
-            "stage": "finalized",
-            "status": "error",
-            "message": "Workflow terminated unexpectedly",
-        })
+
+
+def _worker_thread() -> None:
+    """Process jobs from queue sequentially."""
+    logger.info("Worker thread started")
+    
+    while True:
+        payload = job_queue.get(block=True)
+        if payload is None:
+            break
+            
+        logger.info(f"Processing {payload.company} (job {payload.jobId})")
+        _run_job(payload)
+        job_queue.task_done()
 
 
 @app.post("/scraper", response_model=ScraperResponse)
 async def create_scraper(req: ScraperRequest, request: Request):
+    """Queue a scraper job."""
     if INTERNAL_TOKEN:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header != f"Bearer {INTERNAL_TOKEN}":
+        auth = request.headers.get("Authorization", "")
+        if auth != f"Bearer {INTERNAL_TOKEN}":
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     if not req.company.strip():
-        raise HTTPException(status_code=400, detail="Company is required")
+        raise HTTPException(status_code=400, detail="Company required")
 
-    thread = threading.Thread(
-        target=_run_job,
-        args=(req,),
-        name=f"render-worker-{req.jobId}",
-        daemon=True,
-    )
-    thread.start()
-
-    return ScraperResponse(jobId=req.jobId)
+    # Add to queue
+    job_queue.put(req)
+    position = job_queue.qsize()
+    
+    # Notify queued
+    _post_callback(req.callbackUrl, {
+        "type": "queued",
+        "stage": "queued",
+        "jobId": req.jobId,
+        "company": req.company,
+        "message": f"Queued (position {position})" if position > 1 else "Starting soon",
+        "queuePosition": position,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    
+    logger.info(f"Queued {req.company} at position {position}")
+    return ScraperResponse(jobId=req.jobId, queuePosition=position)
 
 
 @app.get("/healthz")
 async def healthz():
-    return JSONResponse({"status": "ok"})
+    """Health check."""
+    return {"status": "ok", "queue_size": job_queue.qsize()}
+
+
+@app.on_event("startup")
+async def startup():
+    """Start worker thread."""
+    threading.Thread(target=_worker_thread, daemon=True).start()
+    logger.info("Worker started")

@@ -186,8 +186,7 @@ def api_create_scraper():
 
     queue.put({
         'type': 'update',
-        'stage': 'queued',
-        'message': 'Queued and waiting for worker',
+        'message': 'Job queued, waiting for worker',
         'company': company,
         'timestamp': datetime.utcnow().isoformat()
     })
@@ -196,94 +195,46 @@ def api_create_scraper():
     if not render_url:
         queue.put({
             'type': 'error',
-            'stage': 'error',
-            'status': 'error',
-            'company': company,
-            'message': 'RENDER_SCRAPER_URL environment variable not configured',
+            'message': 'RENDER_SCRAPER_URL not configured',
             'timestamp': datetime.utcnow().isoformat()
         })
         queue.put(None)
-        _unregister_progress_channel(job_id)
-        return jsonify({'success': False, 'error': 'Server not configured for scraper generation'}), 500
+        return jsonify({'success': False, 'error': 'Server not configured'}), 500
     
     render_token = os.getenv('RENDER_API_KEY')
-
-    callback_path = f"/api/create-scraper/callback/{job_id}"
-    callback_url = urljoin(request.url_root, callback_path.lstrip('/'))
-
     headers = {'Content-Type': 'application/json'}
     if render_token:
         headers['Authorization'] = f"Bearer {render_token}"
 
-    render_payload = {
-        'company': company,
-        'geminiApiKey': gemini_key,
-        'jobId': job_id,
-        'callbackUrl': callback_url
-    }
-
     try:
-        response = requests.post(render_url, json=render_payload, headers=headers, timeout=15)
+        response = requests.post(
+            render_url,
+            json={
+                'company': company,
+                'geminiApiKey': gemini_key,
+                'jobId': job_id,
+                'callbackUrl': urljoin(request.url_root, f"api/create-scraper/callback/{job_id}")
+            },
+            headers=headers,
+            timeout=10
+        )
         response.raise_for_status()
-    except requests.RequestException as exc:
-        logger.exception("Failed to start Render scraper job: %s", exc)
+        render_response = response.json()
+    except Exception as exc:
+        logger.exception(f"Render request failed: {exc}")
         queue.put({
             'type': 'error',
-            'stage': 'error',
-            'status': 'error',
-            'company': company,
-            'message': f'Render request failed: {exc}',
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        queue.put({
-            'type': 'finalized',
-            'stage': 'finalized',
-            'status': 'error',
-            'company': company,
-            'message': 'Workflow terminated unexpectedly',
+            'message': f'Failed to start job: {exc}',
             'timestamp': datetime.utcnow().isoformat()
         })
         queue.put(None)
-        return jsonify({'success': False, 'error': 'Failed to start Render job'}), 502
+        return jsonify({'success': False, 'error': 'Failed to start job'}), 502
 
-    try:
-        render_response = response.json() if response.content else {}
-    except ValueError:
-        preview = (response.text or '').strip()[:300]
-        logger.error("Render job returned non-JSON payload: %s", preview)
-        queue.put({
-            'type': 'error',
-            'stage': 'error',
-            'status': 'error',
-            'company': company,
-            'message': 'Render worker returned an unexpected response format. Please verify the RENDER_SCRAPER_URL.',
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        queue.put({
-            'type': 'finalized',
-            'stage': 'finalized',
-            'status': 'error',
-            'company': company,
-            'message': 'Workflow terminated unexpectedly',
-            'timestamp': datetime.utcnow().isoformat()
-        })
-        queue.put(None)
-        _unregister_progress_channel(job_id)
-        return jsonify({
-            'success': False,
-            'error': 'Render worker response was not JSON. Confirm RENDER_SCRAPER_URL points to your worker /scraper endpoint.'
-        }), 502
-
-    queue.put({
-        'type': 'update',
-        'stage': 'render-dispatch',
-        'message': 'Render job accepted',
-        'company': company,
-        'renderJobId': render_response.get('jobId'),
-        'timestamp': datetime.utcnow().isoformat()
+    return jsonify({
+        'success': True,
+        'jobId': job_id,
+        'queuePosition': render_response.get('queuePosition', 1)
     })
-
-    return jsonify({'success': True, 'jobId': job_id, 'render': render_response})
 
 
 @app.route('/api/create-scraper/callback/<job_id>', methods=['POST'])

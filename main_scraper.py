@@ -127,33 +127,46 @@ class CompanyJobScraper:
             )
             self._emit_progress(callback, {'stage': 'generation', 'message': 'Scraper script generated', 'company': company_name})
             
+            # Check if this is monitor mode (no internships found)
+            monitor_mode = analysis.get('monitor_mode', False) or analysis.get('no_internships_found', False)
+            
             # Store in database
             final_url = analysis.get("final_url", job_board_url)
-            company_id = self.db.add_company(company_name, final_url, scraper_script)
+            company_id = self.db.add_company_with_mode(company_name, final_url, scraper_script, monitor_mode=monitor_mode)
+            
+            mode_str = "MONITOR MODE" if monitor_mode else "NORMAL MODE"
             self._emit_progress(callback, {
                 'stage': 'storage',
-                'message': 'Company persisted to Supabase',
+                'message': f'Company persisted to Supabase ({mode_str})',
                 'company_id': company_id,
-                'company': company_name
+                'company': company_name,
+                'monitor_mode': monitor_mode
             })
             
             # Create scrapers directory if it doesn't exist
             scrapers_dir = "scrapers"
             os.makedirs(scrapers_dir, exist_ok=True)
             
-            # Save standalone scraper script
-            script_file = os.path.join(scrapers_dir, f"{company_name.lower().replace(' ', '_')}_scraper.py")
+            # Save standalone scraper script (monitor or normal)
+            if monitor_mode:
+                script_file = os.path.join(scrapers_dir, f"{company_name.lower().replace(' ', '_')}_monitor.py")
+                success_message = f'Monitor scraper ready for {company_name} (will check for new internships)'
+            else:
+                script_file = os.path.join(scrapers_dir, f"{company_name.lower().replace(' ', '_')}_scraper.py")
+                success_message = f'Scraper ready for {company_name}'
+            
             with open(script_file, 'w') as f:
                 f.write(scraper_script)
             
-            self.logger.info(f"Successfully added {company_name} (ID: {company_id})")
+            self.logger.info(f"Successfully added {company_name} (ID: {company_id}) - {mode_str}")
             self._emit_progress(callback, {
                 'stage': 'complete',
                 'status': 'success',
-                'message': f'Scraper ready for {company_name}',
+                'message': success_message,
                 'script_file': script_file,
                 'config_url': final_url,
                 'company': company_name,
+                'monitor_mode': monitor_mode,
                 'type': 'complete'
             })
             return True
@@ -178,17 +191,36 @@ class CompanyJobScraper:
             return []
         
         try:
-            # Method 1: Execute the company's generated scraper script (database-integrated)
-            script_file = os.path.join("scrapers", f"{company_name.lower().replace(' ', '_')}_scraper.py")
+            # Check if this is a monitor-mode company
+            monitor_mode = company.get('monitor_mode', False)
+            
+            if monitor_mode:
+                # Execute monitor scraper (checks for changes, not jobs)
+                script_file = os.path.join("scrapers", f"{company_name.lower().replace(' ', '_')}_monitor.py")
+            else:
+                # Execute regular scraper
+                script_file = os.path.join("scrapers", f"{company_name.lower().replace(' ', '_')}_scraper.py")
+            
+            if not os.path.exists(script_file):
+                self.logger.error(f"Scraper script not found: {script_file}")
+                return []
                 
             result = subprocess.run([sys.executable, script_file], 
                                     capture_output=True, text=True, cwd=os.getcwd())
             
             if result.returncode == 0:
                 self.logger.info(f"Successfully executed scraper for {company_name}")
-                # Get recently scraped jobs from database
-                recent_jobs = self.db.get_jobs_by_company(company['id'], limit=50)
-                return recent_jobs
+                
+                if monitor_mode:
+                    # Monitor mode - no jobs expected, just checking for changes
+                    self.logger.info(f"Monitor mode: Check complete. See output for change detection results.")
+                    # Print the monitor output for user visibility
+                    print(result.stdout)
+                    return []
+                else:
+                    # Normal mode - get recently scraped jobs from database
+                    recent_jobs = self.db.get_jobs_by_company(company['id'], limit=50)
+                    return recent_jobs
             else:
                 self.logger.error(f"Scraper failed for {company_name}: {result.stderr}")
                 # Log the failure

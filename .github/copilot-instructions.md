@@ -1,4 +1,5 @@
 # Copilot Instructions for ScraperGenerator
+Never make summary documents to explain your changes.
 
 ## Core architecture
 - Primary workflow lives in `main_scraper.py`: `SearchEngine` → `AINavigator` → `PlaywrightScraperSync` → `SupabaseDatabaseManager`.

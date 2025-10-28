@@ -121,7 +121,7 @@ class AINavigator:
             self._emit_progress({'stage': 'browser', 'message': 'Launching analysis browser'})
             self._playwright = sync_playwright().start()
             self._browser = self._playwright.firefox.launch(
-                headless=True,  # Set to True for production
+                headless=False,  # Set to True for production
                 firefox_user_prefs={
                     "javascript.enabled": True,
                     "dom.webdriver.enabled": False,
@@ -275,7 +275,7 @@ class AINavigator:
                     self.logger.info(f"Final analysis includes search_required: {analysis.get('search_required', 'MISSING')}")
                     
                     # Validate the generated config
-                    validation_result = self._validate_complete_config(analysis, internship_url, html_structure)
+                    validation_result = self._validate_complete_config(analysis, internship_url, html_structure, is_final_attempt=(attempt == max_attempts))
                     
                     if validation_result["success"]:
                         self.logger.info(f"Analysis successful on attempt {attempt}")
@@ -283,8 +283,22 @@ class AINavigator:
                         self._emit_progress({'stage': 'analysis', 'message': 'Selectors validated successfully', 'attempt': attempt})
                         self._emit_progress({'stage': 'analysis', 'message': 'Analysis completed successfully', 'status': 'success'})
                         return analysis
+                    elif validation_result.get("monitor_mode"):
+                        # LLM detected no internships available - enter monitor mode
+                        self.logger.info("LLM confirmed NO internships - entering MONITOR MODE")
+                        self._emit_progress({'stage': 'analysis', 'message': 'No internships currently available - creating monitor', 'status': 'warning'})
+                        
+                        analysis['no_internships_found'] = True
+                        analysis['monitor_mode'] = True
+                        analysis['final_url'] = internship_url
+                        analysis.update(search_info)
+                        return analysis
                     else:
-                        # Prepare feedback for next attempt
+                        # Validation failed - retry or give up
+                        if attempt == max_attempts:
+                            error_msg = validation_result.get('error', f"Config validation failed. Issues: {validation_result.get('issues', [])}")
+                            return {"error": f"Config validation failed after all retry attempts: {error_msg}"}
+                        
                         previous_feedback = {
                             "previous_analysis": analysis,
                             "validation_issues": validation_result.get('issues', []),
@@ -295,11 +309,8 @@ class AINavigator:
                         error_msg = validation_result.get('error', f"LLM recommended retry. Issues: {validation_result.get('issues', [])}")
                         self.logger.warning(f"Attempt {attempt}: Config validation failed: {error_msg}")
                         self._emit_progress({'stage': 'validation', 'message': error_msg, 'attempt': attempt, 'status': 'warning'})
-                        
-                        if attempt < max_attempts:
-                            self._wait_before_retry(attempt)
-                            continue
-                        return {"error": f"Config validation failed after all retry attempts: {error_msg}"}
+                        self._wait_before_retry(attempt)
+                        continue
                         
                 except Exception as e:
                     self.logger.error(f"Attempt {attempt}: Unexpected error during analysis: {str(e)}")
@@ -595,20 +606,85 @@ Return 1-2 sentences explaining the issue:"""
         return reason if reason else "Page does not contain internship job listings"
     
     def _handle_search_bar_interaction(self, url: str, page_content: str, content_data: Dict = None) -> Optional[Dict]:
-        """Handle search bar detection and interaction if needed."""
-        search_analysis = self._llm_analyze_search_need(url, page_content, content_data)
-        if not search_analysis or not search_analysis.get('search_required'):
-            return None
-        return self._perform_search(url, search_analysis)
+        """Handle search bar detection and interaction with retry logic (up to 3 attempts)."""
+        max_attempts = 3
+        previous_failure = None
+        
+        for attempt in range(1, max_attempts + 1):
+            # Get search analysis from LLM (with previous failure feedback if retrying)
+            search_analysis = self._llm_analyze_search_need(url, page_content, content_data, previous_failure)
+            
+            if not search_analysis or not search_analysis.get('search_required'):
+                return None
+            
+            # Attempt search interaction
+            result = self._perform_search(url, search_analysis)
+            
+            if result.get('success'):
+                # Success - return the result
+                self.logger.info(f"Search interaction succeeded on attempt {attempt}")
+                return result
+            else:
+                # Failed - prepare feedback for next attempt
+                self.logger.warning(f"Search attempt {attempt}/{max_attempts} failed: {result.get('error')}")
+                
+                if attempt < max_attempts:
+                    # Prepare feedback for LLM retry
+                    previous_failure = {
+                        'search_input_selector': search_analysis.get('search_input_selector', ''),
+                        'search_submit_selector': search_analysis.get('search_submit_selector', ''),
+                        'search_query': search_analysis.get('search_query', ''),
+                        'error': result.get('error', ''),
+                        'failed_selector': result.get('failed_selector', ''),
+                        'interaction_mode': result.get('interaction_mode', '')
+                    }
+                    
+                    self.logger.info(f"Waiting 2 seconds before retry...")
+                    time.sleep(2)
+                    continue
+                else:
+                    # All attempts failed
+                    self.logger.error(f"Search interaction failed after {max_attempts} attempts. Continuing without search.")
+                    return None
+        
+        return None
     
-    def _llm_analyze_search_need(self, url: str, page_content: str, content_data: Dict = None) -> Optional[Dict]:
-        """Use LLM to analyze if we need to search and identify search elements."""
+    def _llm_analyze_search_need(self, url: str, page_content: str, content_data: Dict = None, previous_failure: Optional[Dict] = None) -> Optional[Dict]:
+        """Use LLM to analyze if we need to search and identify search elements.
+        
+        Args:
+            url: Page URL
+            page_content: Raw HTML content
+            content_data: Pre-extracted content data (optional)
+            previous_failure: Info from previous failed search attempt (optional)
+        """
         if content_data is None:
             content_data = self._extract_clean_content_and_links(page_content, url)
         visible_text = content_data['visible_text'][:8000]
         html_structure = content_data['cleaned_html'][:100000]
         
-        prompt = f"""You are a web scraping expert. Analyze this job board page and determine if interaction is needed to filter for internship/co-op positions. 
+        retry_context = ""
+        if previous_failure:
+            retry_context = f"""
+
+**RETRY CONTEXT - PREVIOUS ATTEMPT FAILED:**
+Previous selectors that FAILED:
+- Input selector: {previous_failure.get('search_input_selector', 'N/A')}
+- Submit selector: {previous_failure.get('search_submit_selector', 'N/A')}
+- Search query: {previous_failure.get('search_query', 'N/A')}
+
+Error: {previous_failure.get('error', 'Unknown error')}
+Failed selector: {previous_failure.get('failed_selector', 'Unknown')}
+
+You MUST provide DIFFERENT selectors that avoid this failure. Common issues:
+- Overlays/modals blocking clicks (try dismissing them first or find alternative buttons)
+- Non-unique selectors matching multiple elements
+- Elements not yet loaded when clicked
+
+Analyze the HTML again and find BETTER, MORE SPECIFIC selectors.
+"""
+        
+        prompt = f"""You are a web scraping expert. Analyze this job board page and determine if interaction is needed to filter for internship/co-op positions.{retry_context} 
 
 **SELECTOR REQUIREMENTS - CRITICAL:**
 Your selector MUST match EXACTLY ONE element. Multi-match selectors will fail.
@@ -634,8 +710,8 @@ Your selector MUST match EXACTLY ONE element. Multi-match selectors will fail.
    - Requires: `search_submit_selector` (button/link that applies internship filter)
    - Leave search_query and search_input_selector empty
 
-**NOT supported (return search_required=false):**
-- Dropdown menus (<select>)
+**NOT Preferred (try to use search bar or alternative buttons, but use if absolutely necessary):**
+- Dropdown menus (<select>) 
 - Checkboxes/radio buttons
 - Multi-step filter forms
 
@@ -662,8 +738,12 @@ You should not use the URL primarily in order to come up with the decision on if
         self.logger.info(f"LLM search analysis: {result}")
         return result
     
-    def _perform_search(self, url: str, search_analysis: Dict) -> Optional[Dict]:
-        """Perform search or button interaction with selector validation."""
+    def _perform_search(self, url: str, search_analysis: Dict) -> Dict:
+        """Perform search or button interaction with selector validation.
+        
+        Returns:
+            Dict with 'success' boolean and either result data or 'error' details
+        """
         search_query = search_analysis.get('search_query', '')
         input_selector = search_analysis.get('search_input_selector', '')
         submit_selector = search_analysis.get('search_submit_selector', '')
@@ -673,7 +753,7 @@ You should not use the URL primarily in order to come up with the decision on if
         
         if not is_button_mode and not is_search_mode:
             self.logger.warning("Search analysis provided but insufficient selectors (need either button selector OR input selector + query)")
-            return None
+            return {'success': False, 'error': 'Insufficient selectors provided'}
             
         # Navigate to page if not already there
         if self._page is None or self._page.url != url:
@@ -682,29 +762,49 @@ You should not use the URL primarily in order to come up with the decision on if
         original_url = self._page.url
         
         # Perform interaction based on mode
+        # Use lower timeout (3s) for single-attempt failure detection
         if is_button_mode:
             # BUTTON MODE: Click a single button or link
             try:
                 self.logger.info(f"Clicking button/link: {submit_selector}")
-                self._page.locator(submit_selector).click(timeout=10000)
+                self._page.evaluate(f"document.querySelector({repr(submit_selector)}).click()")
             except Exception as e:
-                self.logger.error(f"Failed to click button/link {submit_selector}: {e}")
-                return None
+                error_msg = str(e)
+                self.logger.error(f"Failed to click button/link {submit_selector}: {error_msg}")
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'failed_selector': submit_selector,
+                    'interaction_mode': 'button'
+                }
         elif is_search_mode:
             # SEARCH MODE: Fill text input and submit
             try:
                 self.logger.info(f"Filling search input '{input_selector}' with query '{search_query}'")
-                self._page.locator(input_selector).fill(search_query)
+                self._page.locator(input_selector).fill(search_query, timeout=3000)
                 
                 if submit_selector:
                     self.logger.info(f"Clicking submit button: {submit_selector}")
-                    self._page.locator(submit_selector).click(timeout=10000)
+                    self._page.evaluate(f"document.querySelector({repr(submit_selector)}).click()")
                 else:
                     self.logger.info("Pressing Enter to submit")
                     self._page.locator(input_selector).press('Enter')
             except Exception as e:
-                self.logger.error(f"Failed to perform search: {e}")
-                return None
+                error_msg = str(e)
+                self.logger.error(f"Failed to perform search: {error_msg}")
+                # Determine which selector failed
+                failed_selector = submit_selector if 'click' in error_msg.lower() else input_selector
+                return {
+                    'success': False,
+                    'error': error_msg,
+                    'failed_selector': failed_selector,
+                    'interaction_mode': 'search',
+                    'search_query': search_query
+                }
+        
+        # Wait 3 seconds for potential delayed URL changes
+        self.logger.info("Waiting 3 seconds for potential URL changes after interaction...")
+        time.sleep(3)
         
         # Wait 3 seconds for potential delayed URL changes
         self.logger.info("Waiting 3 seconds for potential URL changes after interaction...")
@@ -722,6 +822,7 @@ You should not use the URL primarily in order to come up with the decision on if
         current_url = self._page.url
         
         result = {
+            'success': True,
             'search_performed': True, 
             'search_input_selector': input_selector,
             'search_submit_selector': submit_selector,
@@ -985,7 +1086,7 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
         # The unified _analyze_with_ai method now handles both scenarios
         return self._analyze_with_ai(url, html_structure, previous_feedback)
     
-    def _validate_complete_config(self, analysis: Dict, url: str, html_structure: str) -> Dict:
+    def _validate_complete_config(self, analysis: Dict, url: str, html_structure: str, is_final_attempt: bool = False) -> Dict:
         """
         Use PlaywrightScraper to validate the configuration.
         
@@ -1037,16 +1138,16 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
             self.logger.info(f"PlaywrightScraper extracted {len(jobs)} sample jobs for validation")
             self._emit_progress({'stage': 'validation', 'message': f'Validation extracted {len(jobs)} sample jobs'})
             
-            # Let LLM evaluate the results
-            return self._llm_evaluate_config(analysis, jobs, html_structure, url)
+            # Let LLM evaluate the results (with monitor mode detection on final attempt)
+            return self._llm_evaluate_config(analysis, jobs, html_structure, url, is_final_attempt)
             
         except Exception as e:
             self.logger.error(f"PlaywrightScraper validation failed: {str(e)}")
             self._emit_progress({'stage': 'validation', 'message': str(e), 'status': 'error'})
             return {"success": False, "error": f"Validation failed: {str(e)}"}
     
-    def _llm_evaluate_config(self, analysis: Dict, jobs: List[Dict], html_structure: str, url: str) -> Dict:
-        """Let LLM evaluate the config based on all test results."""
+    def _llm_evaluate_config(self, analysis: Dict, jobs: List[Dict], html_structure: str, url: str, is_final_attempt: bool = False) -> Dict:
+        """Let LLM evaluate the config based on all test results. Returns success, retry_recommended, or monitor_mode."""
         self.logger.info("LLM evaluating config results...")
         self._emit_progress({'stage': 'analysis', 'message': 'Evaluating config quality with AI'})
         
@@ -1056,38 +1157,28 @@ Identify specific CSS selectors for scraping internship job listings. Look for r
         # Prepare job sample
         job_sample = jobs[:3] if jobs else []
         
-        system_prompt = """You are evaluating a job scraper configuration for INTERNSHIP positions. Analyze the test results and determine if the config is good or needs improvement. You have been fed the first 3 jobs extracted as a sample.
+        # Build system prompt with three-outcome evaluation (always available)
+        evaluation_type = f"attempt with {len(jobs)} jobs"
+        system_prompt = """Evaluate job scraper for INTERNSHIP positions.
 
-Return ONLY a valid JSON object with these exact keys:
+THREE possible outcomes:
+1. SUCCESS - Selectors work (jobs extracted)
+2. RETRY - Selectors failed but jobs ARE visible in HTML
+3. MONITOR_MODE - Page has NO internships, not a selector failure (empty state, "no results", etc.)
+
+Return JSON:
 {
   "success": true/false,
-  "issues": ["list of specific issues found"],
-  "suggestions": ["list of specific improvements"],
-  "retry_recommended": true/false
+  "monitor_mode": true/false,
+  "issues": ["issues found"],
+  "suggestions": ["improvements"],
+  "retry_recommended": true/false,
+  "reasoning": "brief explanation"
 }
 
-Evaluation guidelines:
-- CRITICAL REQUIREMENTS (must work for success):
-  * Job container selector finds job elements
-  * Title selector extracts job titles successfully
-  * URL selector extracts valid job links
+MONITOR_MODE only if: zero extracted AND no job HTML visible (not a selector issue)."""
 
-- OPTIONAL ELEMENTS (empty/missing is acceptable):
-  * Description selector - job pages may not have descriptions on listing pages/
-  * Location selector - some sites don't show location in listings
-  * Requirements selector - often not available on listing pages
-  * Pagination selector - only needed if site has multiple pages
-
-- EVALUATION FOCUS:
-  * Only flag issues with selectors that are failing to work when they should. 
-  * Don't penalize empty optional selectors - they may be intentionally empty
-  * Focus on whether the scraper successfully extracts job data (title, URL)
-  * Consider the context: listing pages vs detail pages have different available data
-  * IMPORTANT: Job URLs pointing to different domains (like greenhouse.io, workday.com, etc.) is NORMAL and EXPECTED - many companies use external job board systems
-
-Recommend retry if CRITICAL selectors are broken OR if no jobs are being extracted"""
-
-        user_prompt = f"""Evaluate this job scraper configuration:
+        user_prompt = f"""Evaluate this job scraper configuration ({evaluation_type}):
 
 URL: {url}
 
@@ -1098,12 +1189,13 @@ JOBS EXTRACTED ({len(jobs)} total):
 {json.dumps(job_sample, indent=2)}
 
 HTML STRUCTURE (for reference):
-{html_structure[:500000]}
+{html_structure[:300000]}
 
-Evaluate the configuration quality and recommend if retry is needed."""
+Evaluate the configuration quality and recommend action."""
 
         evaluation = json.loads(self._llm_query(f"{system_prompt}\n\n{user_prompt}", json_response=True))
-        self.logger.info(f"LLM evaluation: {evaluation.get('success')}")
+        self.logger.info(f"LLM evaluation: success={evaluation.get('success')}, monitor_mode={evaluation.get('monitor_mode', False)}, retry={evaluation.get('retry_recommended', False)}")
+        
         return evaluation
     
     def _build_base_config(self, company_name: str, url: str, analysis: Dict) -> Dict:
@@ -1138,8 +1230,14 @@ Evaluate the configuration quality and recommend if retry is needed."""
         return config
     
     def generate_scraper_script(self, company_name: str, url: str, analysis: Dict) -> str:
-        """Generate a standalone Python script that uses PlaywrightScraper."""
+        """Generate a standalone Python script that uses PlaywrightScraper or monitor mode."""
         
+        # Check if this is monitor mode (no internships found)
+        if analysis.get('no_internships_found') or analysis.get('monitor_mode'):
+            self.logger.info("Generating MONITOR MODE scraper (no internships currently available)")
+            return self._generate_monitor_script(company_name, url, analysis)
+        
+        # Normal scraper generation
         # Read the template file
         template_path = os.path.join(os.path.dirname(__file__), 'scraper_template.py')
         with open(template_path, 'r', encoding='utf-8') as f:
@@ -1175,6 +1273,39 @@ Evaluate the configuration quality and recommend if retry is needed."""
             'search_required': str(template_vars['search_required']),  # Convert to string for template
             'backup_filename': f"{company_name.lower().replace(' ', '_')}_jobs_{int(datetime.now().timestamp())}.json"
         })
+        
+        # Fill in the template
+        return template_content.format(**template_vars)
+    
+    def _generate_monitor_script(self, company_name: str, url: str, analysis: Dict) -> str:
+        """Generate a monitor-mode scraper script for pages with no current internships."""
+        
+        # Read the monitor template file
+        template_path = os.path.join(os.path.dirname(__file__), 'monitor_scraper_template.py')
+        with open(template_path, 'r', encoding='utf-8') as f:
+            template_content = f.read()
+        
+        # Prepare template variables
+        scrape_url = analysis.get("final_url", url)
+        
+        template_vars = {
+            'company_name': company_name,
+            'scrape_url': scrape_url,
+            'search_required': analysis.get('search_required', False),
+            'search_input_selector': analysis.get('search_input_selector', ''),
+            'search_submit_selector': analysis.get('search_submit_selector', ''),
+            'search_query': analysis.get('search_query', 'intern'),
+            'generated_at': datetime.now().isoformat(),
+            'log_filename': f"{company_name.lower().replace(' ', '_')}_monitor.log",
+        }
+        
+        # Escape string fields
+        for key in ['company_name', 'scrape_url', 'search_input_selector', 'search_submit_selector', 'search_query']:
+            if key in template_vars and isinstance(template_vars[key], str):
+                template_vars[key] = repr(template_vars[key])[1:-1]
+        
+        # Convert booleans to strings for template
+        template_vars['search_required'] = str(template_vars['search_required'])
         
         # Fill in the template
         return template_content.format(**template_vars)

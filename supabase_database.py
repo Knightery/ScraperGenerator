@@ -697,3 +697,114 @@ class SupabaseDatabaseManager:
                 'error': str(e),
                 'timestamp': datetime.utcnow().isoformat()
             }
+    
+    # Monitor Mode Methods
+    
+    def save_monitor_snapshot(self, company_id: int, page_url: str, html_hash: str, html_sample: str = None):
+        """Save or update a monitor snapshot for a company."""
+        try:
+            data = {
+                'company_id': company_id,
+                'page_url': page_url,
+                'html_hash': html_hash,
+                'html_sample': html_sample,
+                'last_checked': datetime.utcnow().isoformat()
+            }
+            
+            # Check if snapshot already exists
+            existing = self.supabase.table('monitor_snapshots')\
+                .select('id')\
+                .eq('company_id', company_id)\
+                .execute()
+            
+            if existing.data:
+                # Update existing snapshot
+                result = self.supabase.table('monitor_snapshots')\
+                    .update(data)\
+                    .eq('company_id', company_id)\
+                    .execute()
+                self.logger.info(f"Updated monitor snapshot for company {company_id}")
+            else:
+                # Insert new snapshot
+                result = self.supabase.table('monitor_snapshots')\
+                    .insert(data)\
+                    .execute()
+                self.logger.info(f"Created new monitor snapshot for company {company_id}")
+            
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error saving monitor snapshot for company {company_id}: {e}")
+            return False
+    
+    def get_monitor_snapshot(self, company_id: int) -> Optional[Dict]:
+        """Get the monitor snapshot for a company."""
+        try:
+            result = self.supabase.table('monitor_snapshots')\
+                .select('*')\
+                .eq('company_id', company_id)\
+                .execute()
+            
+            if result.data:
+                return result.data[0]
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error getting monitor snapshot for company {company_id}: {e}")
+            return None
+    
+    def update_monitor_snapshot_timestamp(self, company_id: int):
+        """Update the last_checked timestamp for a monitor snapshot."""
+        try:
+            self.supabase.table('monitor_snapshots')\
+                .update({'last_checked': datetime.utcnow().isoformat()})\
+                .eq('company_id', company_id)\
+                .execute()
+            
+            self.logger.info(f"Updated monitor snapshot timestamp for company {company_id}")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error updating monitor snapshot timestamp for company {company_id}: {e}")
+            return False
+    
+    def add_company_with_mode(self, name: str, job_board_url: str, scraper_script: str = None, monitor_mode: bool = False) -> int:
+        """Add a new company with optional monitor mode flag."""
+        try:
+            # Check if company already exists
+            existing = self.get_company_by_name(name)
+            if existing:
+                self.logger.warning(f"Company {name} already exists with ID: {existing['id']}")
+                # Update if switching to/from monitor mode
+                if monitor_mode != existing.get('monitor_mode', False):
+                    self.supabase.table('companies')\
+                        .update({
+                            'monitor_mode': monitor_mode,
+                            'scraper_script': scraper_script,
+                            'job_board_url': job_board_url
+                        })\
+                        .eq('id', existing['id'])\
+                        .execute()
+                    self.logger.info(f"Updated company {name} monitor_mode to {monitor_mode}")
+                return existing['id']
+            
+            data = {
+                'name': name,
+                'job_board_url': job_board_url,
+                'scraper_script': scraper_script,
+                'monitor_mode': monitor_mode
+            }
+            
+            result = self.supabase.table('companies').insert(data).execute()
+            
+            if result.data:
+                company_id = result.data[0]['id']
+                mode_str = "MONITOR MODE" if monitor_mode else "NORMAL MODE"
+                self.logger.info(f"Added company: {name} with ID: {company_id} ({mode_str})")
+                return company_id
+            else:
+                raise Exception("No data returned from insert")
+                
+        except Exception as e:
+            self.logger.error(f"Error adding company {name}: {e}")
+            raise

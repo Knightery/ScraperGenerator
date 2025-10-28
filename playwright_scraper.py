@@ -6,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
+from html_cleaning_utils import clean_html_content_comprehensive
 
 def clean_extracted_text(text: str) -> str:
     """Clean extracted text by removing extra whitespace and newlines."""
@@ -121,9 +122,14 @@ class PlaywrightScraper:
                 self.logger.info("Waiting 5 seconds for dynamic content after interaction...")
                 await asyncio.sleep(5)
             
-            # Clean the page HTML content and capture it - TEMPORARILY COMMENTED OUT
-            # filtered_html = await self._clean_page_content(page)
-            filtered_html = await page.evaluate("document.documentElement.outerHTML")  # Get rendered DOM
+            # Clean page HTML to remove irrelevant sections (same as ai_navigator)
+            # This ensures selectors work consistently between analysis and production scraping
+            self.logger.info("Cleaning page HTML to remove irrelevant sections...")
+            raw_html = await page.content()
+            cleaned_html = clean_html_content_comprehensive(raw_html, self.logger)
+            
+            # Inject cleaned HTML back into page so selectors work on cleaned structure
+            await page.set_content(cleaned_html, wait_until='domcontentloaded')
             
             # Extract jobs using the configuration
             jobs = await self._extract_jobs_from_page(page, scraper_config, url)
@@ -134,7 +140,7 @@ class PlaywrightScraper:
                 jobs.extend(additional_jobs)
             
             self.logger.info(f"Successfully scraped {len(jobs)} jobs")
-            return jobs, filtered_html
+            return jobs, cleaned_html
             
         except Exception as e:
             self.logger.error(f"Error scraping jobs from {url}: {str(e)}")
@@ -345,9 +351,9 @@ class PlaywrightScraper:
                 # Get current page URL before clicking (for debugging)
                 current_url = page.url
                 
-                # Click next page with force to bypass overlays
+                # Click next page using JavaScript to bypass overlays
                 try:
-                    await next_link.click(force=True)
+                    await page.evaluate(f"document.querySelector({repr(pagination_selector)}).click()")
                 except Exception as click_error:
                     self.logger.warning(f"Failed to click next page link: {str(click_error)}")
                     break
@@ -463,7 +469,7 @@ class PlaywrightScraper:
             if is_button_mode:
                 # BUTTON MODE: Click filter/category button directly
                 self.logger.info(f"Performing button interaction: clicking '{search_submit_selector}'")
-                await target_frame.locator(search_submit_selector).click()
+                await page.evaluate(f"document.querySelector({repr(search_submit_selector)}).click()")
                 self.logger.info("Clicked filter button successfully")
                 
             elif is_search_mode:
@@ -476,7 +482,7 @@ class PlaywrightScraper:
                 
                 # Submit search
                 if search_submit_selector:
-                    await target_frame.locator(search_submit_selector).click()
+                    await page.evaluate(f"document.querySelector({repr(search_submit_selector)}).click()")
                     self.logger.info("Clicked search submit button")
                 else:
                     await target_frame.locator(search_input_selector).press('Enter')
